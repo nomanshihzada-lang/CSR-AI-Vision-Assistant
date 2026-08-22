@@ -1,0 +1,6 @@
+1.1
+--- WHAT'S NEW ---
+• Added new mode: Translate Image Text (Extracts text and translates it to your selected language)
+• Added latest AI Models (Gemini 3.5, 3.6, 3.7 Flash & 3.1 Pro)
+• Fixed 'Extract Text Only' crash on empty responses
+• Improved 404 Error handling for unsupported models
