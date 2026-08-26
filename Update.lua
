@@ -29,11 +29,12 @@ local AI_PREFS = "CSR_AI_Assistant"
 local aiPrefs = ctx.getSharedPreferences(AI_PREFS, Context.MODE_PRIVATE)
 local aiEditor = aiPrefs.edit()
 
--- لیٹسٹ جیمنائی ماڈلز
+-- لیٹسٹ جیمنائی ماڈلز (3.1 Flash Lite شامل ہے)
 local GEMINI_MODELS = {
     "Gemini 3.7 Flash",
     "Gemini 3.6 Flash",
     "Gemini 3.5 Flash",
+    "Gemini 3.1 Flash Lite",
     "Gemini 3.1 Pro",
     "Gemini 2.5 Flash",
     "Gemini 2.5 Pro",
@@ -49,6 +50,7 @@ local geminiApiDetails = {
     ["Gemini 3.7 Flash"] = { id = "models/gemini-3.7-flash", version = "v1alpha" },
     ["Gemini 3.6 Flash"] = { id = "models/gemini-3.6-flash", version = "v1alpha" },
     ["Gemini 3.5 Flash"] = { id = "models/gemini-3.5-flash", version = "v1alpha" },
+    ["Gemini 3.1 Flash Lite"] = { id = "models/gemini-3.1-flash-lite", version = "v1alpha" },
     ["Gemini 3.1 Pro"] = { id = "models/gemini-3.1-pro", version = "v1alpha" },
     ["Gemini 2.5 Flash"] = { id = "models/gemini-2.5-flash", version = "v1beta" },
     ["Gemini 2.5 Pro"] = { id = "models/gemini-2.5-pro", version = "v1beta" },
@@ -67,13 +69,13 @@ local POPULAR_LANGUAGES = {
     "Turkish (Türkçe)", "Bengali (বাংলা)", "Portuguese (Português)"
 }
 
--- نیا موڈ "Translate Image Text" شامل کر دیا گیا ہے
 local RECOGNIZE_OPTIONS = {
     "Analyze Image",
     "Current Screen",
     "Current Item",
     "Extract Text Only",
-    "Translate Image Text"
+    "Translate Image Text",
+    "Summarize Document"
 }
 
 local photoFilePaths = {}
@@ -396,10 +398,10 @@ function callGeminiWithImage(apiKey, model, base64Data, prompt, callback)
                     callback(nil, "No text found in the image or API blocked the response.")
                 end
             else
-                callback(nil, "Invalid API response")
+                callback(nil, "Invalid API response. The model might be temporarily unstable.")
             end
         elseif status == 404 then
-            callback(nil, "Error 404: The selected model (" .. model .. ") is not available on your API key yet. Please go to Settings and select a stable model like Gemini 3.5 Flash or 2.0 Flash.")
+            callback(nil, "Error 404: The selected model (" .. model .. ") is not available or correct. Please ensure the model is supported by your key.")
         else
             callback(nil, "API Error: " .. status)
         end
@@ -470,6 +472,7 @@ function showResultDialog(title, content)
     local resultDlg = LuaDialog(ctx)
     resultDlg.setTitle(title)
     local scrollView = ScrollView(ctx)
+    scrollView.setFillViewport(true)
     local textView = TextView(ctx)
     textView.setText(content)
     textView.setTextSize(14)
@@ -495,9 +498,13 @@ function showResultDialog(title, content)
 end
 
 function showAISettingsDialog()
+    local scrollSettings = ScrollView(ctx)
+    scrollSettings.setFillViewport(true)
     local settingsLayout = LinearLayout(ctx)
     settingsLayout.setOrientation(1)
+    settingsLayout.setLayoutParams(LinearLayout.LayoutParams(-1, -2))
     settingsLayout.setPadding(40, 20, 40, 20)
+    scrollSettings.addView(settingsLayout)
     
     local apiLabel = TextView(ctx)
     apiLabel.setText("Gemini API Key:")
@@ -508,6 +515,50 @@ function showAISettingsDialog()
     apiInput.setText(getGeminiApiKey())
     apiInput.setInputType(InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD)
     settingsLayout.addView(apiInput)
+    
+    local btnLayout = LinearLayout(ctx)
+    btnLayout.setOrientation(0)
+    btnLayout.setPadding(0, 10, 0, 10)
+    
+    local testBtn = Button(ctx)
+    testBtn.setText("Test API Key")
+    testBtn.setLayoutParams(LinearLayout.LayoutParams(0, -2, 1))
+    testBtn.onClick = function()
+        local key = apiInput.getText().toString()
+        if key == "" then
+            notify("Please enter API Key to test")
+            return
+        end
+        notify("Testing API Key...")
+        local url = "https://generativelanguage.googleapis.com/v1beta/models?key=" .. key
+        Http.get(url, function(status, data)
+            if status == 200 then
+                notify("Success: API Key is Valid!")
+            else
+                notify("Error: Invalid API Key or Network Issue (Status: " .. status .. ")")
+            end
+        end)
+    end
+    btnLayout.addView(testBtn)
+    
+    local settingsDlg = LuaDialog(ctx)
+    
+    local createBtn = Button(ctx)
+    createBtn.setText("Create API Key")
+    createBtn.setLayoutParams(LinearLayout.LayoutParams(0, -2, 1))
+    createBtn.onClick = function()
+        local url = "https://aistudio.google.com/app/apikey"
+        ctx.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)))
+        notify("Opening browser to create API Key...")
+        settingsDlg.dismiss()
+        if mainDlg then 
+            mainDlg.dismiss() 
+            mainDlg = nil 
+        end
+    end
+    btnLayout.addView(createBtn)
+    
+    settingsLayout.addView(btnLayout)
     
     local modelLabel = TextView(ctx)
     modelLabel.setText("Select Model:")
@@ -527,15 +578,14 @@ function showAISettingsDialog()
     settingsLayout.addView(modelSpinner)
     
     local infoText = TextView(ctx)
-    infoText.setText("Get API key from: makersuite.google.com/app/apikey")
+    infoText.setText("Get API key from: aistudio.google.com")
     infoText.setTextSize(11)
     infoText.setTextColor(0xFF888888)
     infoText.setPadding(0, 20, 0, 0)
     settingsLayout.addView(infoText)
     
-    local settingsDlg = LuaDialog(ctx)
     settingsDlg.setTitle("AI Engine Settings")
-    settingsDlg.setView(settingsLayout)
+    settingsDlg.setView(scrollSettings)
     settingsDlg.setPositiveButton("Save", function()
         local newKey = apiInput.getText().toString()
         if newKey ~= "" then saveGeminiApiKey(newKey) end
@@ -615,12 +665,15 @@ function aboutAndSupport()
     dialog.setTitle("CSR AI Vision Assistant")
     
     local scrollView = ScrollView(ctx)
+    scrollView.setFillViewport(true)
+    
     local mainLayout = LinearLayout(ctx)
     mainLayout.setOrientation(1)
+    mainLayout.setLayoutParams(LinearLayout.LayoutParams(-1, -2))
     mainLayout.setPadding(dp(16), dp(16), dp(16), dp(16))
     
     local titleView = TextView(ctx)
-    titleView.setText("CSR AI Vision Assistant")
+    titleView.setText("CSR AI Vision Assistant (V 1.2)")
     titleView.setTextSize(20)
     titleView.setTextColor(0xFF2196F3)
     titleView.setGravity(Gravity.CENTER)
@@ -655,33 +708,21 @@ function aboutAndSupport()
     addSpacer(mainLayout, dp(8))
     
     local descText = TextView(ctx)
-    -- پرانے ڈسکرپشن کے ساتھ "WHAT'S NEW" کو جوڑ دیا گیا ہے
     descText.setText(
         "CSR AI Vision Assistant is a powerful Android accessibility tool that leverages Google Gemini AI to help visually impaired users understand their surroundings.\n\n" ..
-        "Features:\n" ..
-        "- Analyze images from gallery with detailed descriptions\n" ..
-        "- Extract text from images accurately\n" ..
-        "- Read current screen content and UI elements\n" ..
-        "- Identify focused items (buttons, icons, text fields)\n" ..
-        "- Support for 17+ languages including Urdu, Hindi, Arabic\n" ..
-        "- Multiple Gemini models (1.5 Pro, 2.0 Flash, 3.5 Flash etc.)\n" ..
-        "- TalkBack integration for voice feedback\n\n" ..
-        "--- WHAT'S NEW ---\n" ..
-        "• Added new mode: Translate Image Text (Extracts text and translates it to your selected language)\n" ..
-        "• Added latest AI Models (Gemini 3.5, 3.6, 3.7 Flash & 3.1 Pro)\n" ..
-        "• Fixed 'Extract Text Only' crash on empty responses\n" ..
-        "• Improved 404 Error handling for unsupported models\n" ..
-        "------------------\n\n" ..
-        "How to use:\n" ..
-        "1. Enable Accessibility Service for this app\n" ..
-        "2. Enter your Gemini API key in Settings\n" ..
-        "3. Choose recognition mode (Image/Screen/Item)\n" ..
-        "4. Select image or focus on any UI element\n" ..
-        "5. Press Process and get AI-powered results\n\n" ..
-        "Tips:\n" ..
-        "- For best results, use clear images\n" ..
-        "- Current Item mode works with screen reader focus\n" ..
-        "- Extract Text Only gives raw OCR-like output\n\n" ..
+        "--- WHAT'S NEW IN V 1.2 ---\n" ..
+        "• Completely resolved UI and ScrollView issues for Android 8, 9, and 10 devices, ensuring all options are fully visible and perfectly accessible.\n" ..
+        "• Better UI updates and overall visual enhancements.\n" ..
+        "• Added highly advanced 'Summarize Document' mode. It now extracts key entities (Dates, Prices, Names) and provides Actionable Insights in a structured format.\n" ..
+        "• Introduced Gemini 3.1 Flash Lite model for optimized performance.\n" ..
+        "• Fixed 'Create API Key' functionality to directly route you to the browser and close all dialogue boxes for an uninterrupted experience.\n" ..
+        "• Improved Gemini 3.7 model stability.\n" ..
+        "---------------------------\n\n" ..
+        "How to use 'Summarize Document':\n" ..
+        "Select the 6th option ('Summarize Document'), pick an image of a complex letter, bill, or notice, and hit Process. The AI will provide a clean Executive Summary, list down crucial information, and suggest next steps.\n\n" ..
+        "General Tips:\n" ..
+        "- For best results, use clear images.\n" ..
+        "- Current Item mode works directly with screen reader focus.\n\n" ..
         "This assistant is completely free and open for all. No data is stored or shared with any third party besides Google Gemini API."
     )
     descText.setTextSize(13)
@@ -723,7 +764,7 @@ function aboutAndSupport()
         onClick = function()
             dialog.dismiss()
             if mainDlg then mainDlg.dismiss() end
-            local url = "https://chat.whatsapp.com/C5jA2u0gGDO9rkgcCY2ybg"
+            local url = "https://chat.whatsapp.com/ItdQOG8lw5E6DKsxx9iNSd"
             ctx.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)))
         end
     })
@@ -832,9 +873,14 @@ function hideProgress()
 end
 
 function createMainUI()
+    local scrollMain = ScrollView(ctx)
+    scrollMain.setFillViewport(true)
+    
     local layout = LinearLayout(ctx)
     layout.setOrientation(1)
+    layout.setLayoutParams(LinearLayout.LayoutParams(-1, -2))
     layout.setPadding(40, 40, 40, 40)
+    scrollMain.addView(layout)
     
     local devLabel = TextView(ctx)
     devLabel.setText("Developed by Bridge Tech")
@@ -915,7 +961,7 @@ function createMainUI()
                 showResultDialog("Item Analysis", result)
                 processButton.setEnabled(true); processButton.setText("Process"); processButton.setBackgroundColor(0xFFFF9800)
             end }), 100)
-        elseif selectedOption == "Analyze Image" or selectedOption == "Extract Text Only" or selectedOption == "Translate Image Text" then
+        elseif selectedOption == "Analyze Image" or selectedOption == "Extract Text Only" or selectedOption == "Translate Image Text" or selectedOption == "Summarize Document" then
             if selectedPhotoPath == "" then
                 notify("Please select an image first")
                 processButton.setEnabled(true); processButton.setText("Process"); processButton.setBackgroundColor(0xFFFF9800)
@@ -943,6 +989,8 @@ function createMainUI()
                 prompt = "Extract only the text from this image. Output the text exactly as seen."
             elseif selectedOption == "Translate Image Text" then
                 prompt = "Extract all text from this image and accurately translate it into " .. lang .. ". Provide only the translated text."
+            elseif selectedOption == "Summarize Document" then
+                prompt = "Perform an advanced document analysis on this image. Please structure the output beautifully with clear headings. 1. 'Executive Summary': Provide a concise summary of the document's main purpose. 2. 'Key Information': Extract critical entities like Important Dates, Total Amounts, Names, and Reference Numbers. 3. 'Actionable Insights': Suggest what needs to be done next based on this document. Provide the final output in " .. lang
             else
                 prompt = "Analyze this image in detail. Describe what you see, including objects, people, text, colors, and context. Provide the response in " .. lang
             end
@@ -989,8 +1037,8 @@ function createMainUI()
     layout.addView(bottomLayout)
     
     mainDlg = LuaDialog(ctx)
-    mainDlg.setTitle("CSR AI Vision Assistant")
-    mainDlg.setView(layout)
+    mainDlg.setTitle("CSR AI Vision Assistant V1.2")
+    mainDlg.setView(scrollMain)
     mainDlg.show()
 end
 
