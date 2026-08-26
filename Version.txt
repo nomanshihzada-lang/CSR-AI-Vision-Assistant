@@ -1,1 +1,20 @@
 1.2
+CSR AI Vision Assistant is a powerful Android accessibility tool that leverages Google Gemini AI to help visually impaired users understand their surroundings.
+
+--- WHAT'S NEW IN V 1.2 ---
+• Completely resolved UI and ScrollView issues for Android 8, 9, and 10 devices, ensuring all options are fully visible and perfectly accessible.
+• Better UI updates and overall visual enhancements.
+• Added highly advanced 'Summarize Document' mode. It now extracts key entities (Dates, Prices, Names) and provides Actionable Insights in a structured format.
+• Introduced Gemini 3.1 Flash Lite model for optimized performance.
+• Fixed 'Create API Key' functionality to directly route you to the browser and close all dialogue boxes for an uninterrupted experience.
+• Improved Gemini 3.7 model stability.
+---------------------------
+
+How to use 'Summarize Document':
+Select the 6th option ('Summarize Document'), pick an image of a complex letter, bill, or notice, and hit Process. The AI will provide a clean Executive Summary, list down crucial information, and suggest next steps.
+
+General Tips:
+- For best results, use clear images.
+- Current Item mode works directly with screen reader focus.
+
+This assistant is completely free and open for all. No data is stored or shared with any third party besides Google Gemini API.
