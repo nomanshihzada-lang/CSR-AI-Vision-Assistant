@@ -21,6 +21,29 @@ import "android.util.Base64"
 import "java.io.ByteArrayOutputStream"
 import "android.graphics.Rect"
 import "android.view.accessibility.AccessibilityNodeInfo"
+import "android.hardware.Camera"
+import "android.graphics.YuvImage"
+import "android.graphics.ImageFormat"
+import "android.net.ConnectivityManager"
+import "android.net.NetworkCapabilities"
+import "android.content.ContentValues"
+import "android.speech.tts.TextToSpeech"
+import "java.util.Locale"
+import "android.speech.SpeechRecognizer"
+import "android.speech.RecognitionListener"
+import "android.speech.RecognizerIntent"
+import "android.Manifest"
+import "android.content.pm.PackageManager"
+
+-- اینڈرائیڈ 8+ میں کیمرہ Intent کے لیے StrictMode کو بائی پاس کرنا تاکہ FileUriExposedException نہ آئے
+-- نوٹ: یہ کوڈ اکیلا مکمل حفاظت نہیں دیتا — FileUriExposedException کا اصل
+-- حل نیچے createCameraOutputUri()/shareLogFile() میں موجود content:// URI
+-- کا طریقہ ہے۔ یہ بلاک نقصان دہ نہیں، اس لیے بطور اضافی احتیاط رکھا گیا ہے۔
+pcall(function()
+    local StrictMode = luajava.bindClass("android.os.StrictMode")
+    local builder = StrictMode.VmPolicy.Builder()
+    StrictMode.setVmPolicy(builder.build())
+end)
 
 local ctx = service
 local File_CLASS = luajava.bindClass("java.io.File")
@@ -29,36 +52,264 @@ local AI_PREFS = "CSR_AI_Assistant"
 local aiPrefs = ctx.getSharedPreferences(AI_PREFS, Context.MODE_PRIVATE)
 local aiEditor = aiPrefs.edit()
 
--- لیٹسٹ جیمنائی ماڈلز (3.1 Flash Lite شامل ہے)
+-- =====================================================================
+-- CONFIGURATION FILE (سب پیرامیٹرز یہاں سے تبدیل کریں، مین کوڈ کو چھیڑنے
+-- کی ضرورت نہیں۔ نوٹ: یہ ایپ لوکل ماڈل نہیں چلاتی، بلکہ Google کے
+-- ریموٹ Gemini API کو کال کرتی ہے، اس لیے یہاں کوئی مقامی GPU/VRAM
+-- استعمال نہیں ہوتی۔ میموری آپٹیمائزیشن صرف امیج بٹ میپ کے لیے ہے۔)
+-- =====================================================================
+local CONFIG = {
+    -- Image processing
+    MAX_IMAGE_DIMENSION = 1024,      -- API کو بھیجنے سے پہلے امیج کا زیادہ سے زیادہ سائز
+    JPEG_QUALITY = 75,               -- کمپریشن کوالٹی (0-100)
+
+    -- Network / API behaviour
+    MAX_RETRIES = 2,                 -- ناکامی پر API کال دوبارہ کوشش کتنی بار ہو
+    RETRY_DELAY_MS = 1500,           -- ہر ری-ٹرائی کے درمیان وقفہ
+
+    -- Safe mode: بار بار ناکامی پر فیچر کو عارضی طور پر بند کر دینا
+    SAFE_MODE_FAILURE_THRESHOLD = 3, -- اتنی لگاتار ناکامیوں کے بعد Safe Mode فعال ہوگا
+
+    -- Logging
+    LOG_ENABLED = true,
+    LOG_FILE_NAME = "CSR_AI_Assistant_Log.txt",
+    LOG_MAX_LINES = 500,             -- لاگ فائل کو اتنی لائنوں تک محدود رکھنا
+
+    -- Developer contact
+    DEV_WHATSAPP_NUMBER = "923057040811",
+
+    -- Live / Continuous Mode
+    LIVE_MODE_INTERVAL_MS = 6000,     -- ہر کتنے وقفے سے نیا فریم Gemini کو بھیجا جائے (ملی سیکنڈ)
+
+    -- History
+    HISTORY_MAX_ITEMS = 50,           -- زیادہ سے زیادہ کتنے پرانے نتائج محفوظ رہیں
+
+    -- Offline OCR (Tesseract) — صرف تب کام کرے گا اگر پلگ ان موجود ہو
+    OCR_TESSDATA_DIR = "CSR_AI_Assistant/tessdata_parent", -- اس فولڈر کے اندر "tessdata/eng.traineddata" رکھیں
+    OCR_LANGUAGE = "eng"
+}
+
+-- حالتِ نگرانی (state tracking) برائے Safe Mode
+local runtimeState = {
+    consecutiveFailures = 0,
+    safeModeActive = false
+}
+
+-- =====================================================================
+-- LOGGING SYSTEM
+-- ہر اہم قدم (API کال، ایرر، امیج پروسیسنگ وغیرہ) کو ٹائم اسٹیمپ کے
+-- ساتھ ایک لوکل فائل میں محفوظ کیا جاتا ہے تاکہ بعد میں مسئلہ تلاش
+-- کرنا آسان ہو۔
+-- =====================================================================
+local logFilePath = nil
+pcall(function()
+    logFilePath = (os.getenv("EXTERNAL_STORAGE") or "/sdcard") .. "/" .. CONFIG.LOG_FILE_NAME
+end)
+
+function writeLog(level, message)
+    if not CONFIG.LOG_ENABLED or not logFilePath then return end
+    pcall(function()
+        local timeStr = os.date("%Y-%m-%d %H:%M:%S")
+        local line = string.format("[%s] [%s] %s\n", timeStr, level, tostring(message))
+
+        -- لائن کاؤنٹ کی حد کو برقرار رکھنے کے لیے، فائل بہت بڑی ہو جانے پر پرانی لائنیں ہٹا دیں
+        local f = io.open(logFilePath, "r")
+        if f then
+            local lines = {}
+            for l in f:lines() do table.insert(lines, l) end
+            f:close()
+            if #lines >= CONFIG.LOG_MAX_LINES then
+                local trimmed = {}
+                local startIdx = #lines - CONFIG.LOG_MAX_LINES + 1
+                for i = startIdx, #lines do table.insert(trimmed, lines[i]) end
+                local wf = io.open(logFilePath, "w")
+                if wf then
+                    for _, l in ipairs(trimmed) do wf:write(l .. "\n") end
+                    wf:close()
+                end
+            end
+        end
+
+        local af = io.open(logFilePath, "a")
+        if af then
+            af:write(line)
+            af:close()
+        end
+    end)
+end
+
+function logInfo(msg) writeLog("INFO", msg) end
+function logWarn(msg) writeLog("WARN", msg) end
+function logError(msg) writeLog("ERROR", msg) end
+
+function shareLogFile()
+    if not logFilePath then
+        notify("Log file not available")
+        return
+    end
+    local f = File_CLASS(logFilePath)
+    if not f.exists() then
+        notify("No log file found yet")
+        return
+    end
+
+    -- نوٹ: پہلے یہاں Uri.fromFile() استعمال ہو رہا تھا جو Android 7+ پر
+    -- FileUriExposedException دیتا ہے (چاہے پکال میں ہو، شیئر خاموشی سے
+    -- ناکام ہو جاتا ہے)۔ اب لاگ کا متن براہِ راست ٹیکسٹ کے طور پر شیئر
+    -- کیا جاتا ہے — کسی فائل یوآرآئی کی ضرورت نہیں۔
+    local readOk, content = pcall(function()
+        local rf = io.open(logFilePath, "r")
+        if not rf then return nil end
+        local data = rf:read("*a")
+        rf:close()
+        return data
+    end)
+    if not readOk or not content or content == "" then
+        vibratePattern("error")
+        notify("Log file پڑھنے میں مسئلہ ہوا")
+        logError("shareLogFile: could not read log content")
+        return
+    end
+    if #content > 30000 then
+        content = "...(truncated)...\n" .. content:sub(-30000)
+    end
+
+    local shareOk, shareErr = pcall(function()
+        local shareIntent = Intent(Intent.ACTION_SEND)
+        shareIntent.setType("text/plain")
+        shareIntent.putExtra(Intent.EXTRA_SUBJECT, "CSR AI Assistant Log")
+        shareIntent.putExtra(Intent.EXTRA_TEXT, content)
+        local chooser = Intent.createChooser(shareIntent, "Share Log")
+        chooser.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        ctx.startActivity(chooser)
+    end)
+    if not shareOk then
+        logError("shareLogFile: share failed: " .. tostring(shareErr))
+        vibratePattern("error")
+        notify("Share نہیں ہو سکا: " .. tostring(shareErr))
+    end
+end
+
+-- =====================================================================
+-- HISTORY / SAVED RESULTS
+-- ہر AI نتیجہ ٹائم اسٹیمپ کے ساتھ ایک لوکل JSON فائل میں محفوظ ہوتا ہے
+-- تاکہ بعد میں دیکھا/سنا جا سکے۔ SharedPreferences کے بجائے فائل استعمال
+-- کی گئی ہے کیونکہ نتائج بڑے متن پر مشتمل ہو سکتے ہیں۔
+-- =====================================================================
+local historyFilePath = nil
+pcall(function()
+    historyFilePath = (os.getenv("EXTERNAL_STORAGE") or "/sdcard") .. "/CSR_AI_Assistant_History.json"
+end)
+
+function loadHistory()
+    if not historyFilePath then return {} end
+    local ok, list = pcall(function()
+        local f = io.open(historyFilePath, "r")
+        if not f then return {} end
+        local content = f:read("*a")
+        f:close()
+        if not content or content == "" then return {} end
+        local decodeOk, decoded = pcall(cjson.decode, content)
+        if decodeOk and type(decoded) == "table" then return decoded end
+        return {}
+    end)
+    if ok then return list end
+    return {}
+end
+
+function saveHistoryEntry(mode, resultText)
+    if not historyFilePath or not resultText or resultText == "" then return end
+    pcall(function()
+        local history = loadHistory()
+        table.insert(history, 1, {
+            time = os.date("%Y-%m-%d %H:%M:%S"),
+            mode = mode,
+            text = resultText
+        })
+        while #history > CONFIG.HISTORY_MAX_ITEMS do
+            table.remove(history)
+        end
+        local f = io.open(historyFilePath, "w")
+        if f then
+            f:write(cjson.encode(history))
+            f:close()
+        end
+        logInfo("History entry saved: " .. tostring(mode))
+    end)
+end
+
+function clearHistory()
+    if not historyFilePath then return end
+    pcall(function()
+        local f = io.open(historyFilePath, "w")
+        if f then f:write("[]"); f:close() end
+    end)
+    logInfo("History cleared by user.")
+end
+
+function showHistoryDialog()
+    local history = loadHistory()
+    if #history == 0 then
+        notify("ابھی تک کوئی محفوظ شدہ نتیجہ نہیں ہے")
+        return
+    end
+
+    local labels = {}
+    for _, item in ipairs(history) do
+        table.insert(labels, "[" .. item.time .. "] " .. item.mode)
+    end
+
+    local listLayout = LinearLayout(ctx)
+    listLayout.setOrientation(1)
+    local listView = ListView(ctx)
+    listView.setAdapter(ArrayAdapter(ctx, android.R.layout.simple_list_item_1, labels))
+    listLayout.addView(listView)
+
+    local histDlg = LuaDialog(ctx)
+    histDlg.setTitle("Saved History (" .. #history .. ")")
+    histDlg.setView(listLayout)
+    histDlg.setPositiveButton("Close", nil)
+    histDlg.setNegativeButton("Clear All", function()
+        clearHistory()
+        notify("History cleared")
+    end)
+    histDlg.show()
+
+    listView.setOnItemClickListener(AdapterView.OnItemClickListener{
+        onItemClick = function(p, v, pos, id)
+            local item = history[pos + 1]
+            histDlg.dismiss()
+            showResultDialog(item.mode .. " — " .. item.time, item.text)
+        end
+    })
+end
+
+-- لیٹسٹ جیمنائی ماڈلز — ستمبر 2026 تک ویب سرچ سے تصدیق شدہ حقیقی ماڈلز
+-- (نوٹ: Gemini 4 ابھی جاری نہیں ہوا — صرف pre-training میں ہے، اس لیے
+-- شامل نہیں کیا؛ جھوٹا ماڈل ID شامل کرنے سے صرف 404 ایرر آتا۔ پرانے
+-- 2.0/1.5/1.0 ماڈلز مارچ-جون 2026 میں ریٹائر ہو چکے ہیں، اس لیے ہٹا دیے
+-- گئے ہیں تاکہ فہرست میں صرف کام کرنے والے ماڈلز رہیں۔)
 local GEMINI_MODELS = {
+    "Gemini 3.8 Flash",
     "Gemini 3.7 Flash",
     "Gemini 3.6 Flash",
-    "Gemini 3.5 Flash",
-    "Gemini 3.1 Flash Lite",
+    "Gemini 3.5 Flash-Lite",
     "Gemini 3.1 Pro",
+    "Gemini 3.1 Flash Lite",
     "Gemini 2.5 Flash",
-    "Gemini 2.5 Pro",
-    "Gemini 2.0 Flash",
-    "Gemini 2.0 Pro",
-    "Gemini 1.5 Flash",
-    "Gemini 1.5 Pro",
-    "Gemini 1.0 Pro"
+    "Gemini 2.5 Pro"
 }
 
 -- تمام ماڈلز کے API لاجکس ان کے درست version کے ساتھ
 local geminiApiDetails = {
+    ["Gemini 3.8 Flash"] = { id = "models/gemini-3.8-flash", version = "v1alpha" },
     ["Gemini 3.7 Flash"] = { id = "models/gemini-3.7-flash", version = "v1alpha" },
     ["Gemini 3.6 Flash"] = { id = "models/gemini-3.6-flash", version = "v1alpha" },
-    ["Gemini 3.5 Flash"] = { id = "models/gemini-3.5-flash", version = "v1alpha" },
-    ["Gemini 3.1 Flash Lite"] = { id = "models/gemini-3.1-flash-lite", version = "v1alpha" },
+    ["Gemini 3.5 Flash-Lite"] = { id = "models/gemini-3.5-flash-lite", version = "v1alpha" },
     ["Gemini 3.1 Pro"] = { id = "models/gemini-3.1-pro", version = "v1alpha" },
+    ["Gemini 3.1 Flash Lite"] = { id = "models/gemini-3.1-flash-lite", version = "v1alpha" },
     ["Gemini 2.5 Flash"] = { id = "models/gemini-2.5-flash", version = "v1beta" },
-    ["Gemini 2.5 Pro"] = { id = "models/gemini-2.5-pro", version = "v1beta" },
-    ["Gemini 2.0 Flash"] = { id = "models/gemini-2.0-flash", version = "v1beta" },
-    ["Gemini 2.0 Pro"] = { id = "models/gemini-2.0-pro", version = "v1beta" },
-    ["Gemini 1.5 Flash"] = { id = "models/gemini-1.5-flash", version = "v1beta" },
-    ["Gemini 1.5 Pro"] = { id = "models/gemini-1.5-pro", version = "v1beta" },
-    ["Gemini 1.0 Pro"] = { id = "models/gemini-1.0-pro", version = "v1beta" }
+    ["Gemini 2.5 Pro"] = { id = "models/gemini-2.5-pro", version = "v1beta" }
 }
 
 local POPULAR_LANGUAGES = {
@@ -80,6 +331,7 @@ local RECOGNIZE_OPTIONS = {
 
 local photoFilePaths = {}
 local selectedPhotoPath = ""
+local selectedPhotoUri = nil  -- کیمرے سے لی گئی تصویر کا content:// URI (فائل پاتھ کا متبادل)
 local mainDlg = nil
 local processButton = nil
 local progressDlg = nil
@@ -90,15 +342,44 @@ function notify(msg)
 end
 
 function vibrate()
+    vibratePattern("notify")
+end
+
+-- الگ الگ حالتوں کے لیے مختلف Vibration پیٹرنز (بصارت سے محروم صارف کے لیے
+-- اسکرین دیکھے بغیر سمجھنا آسان ہو جاتا ہے کہ کیا ہو رہا ہے)
+--   success    -> ایک مختصر، ہلکا سا جھٹکا
+--   error      -> تین تیز جھٹکے (واضح طور پر الگ محسوس ہوں)
+--   processing -> دو ہلکے مختصر جھٹکے
+--   notify     -> عام مختصر جھٹکا (پرانے vibrate() جیسا)
+function vibratePattern(kind)
     local vibrator = ctx.getSystemService(Context.VIBRATOR_SERVICE)
-    if vibrator then vibrator.vibrate(35) end
+    if not vibrator then return end
+
+    local patterns = {
+        success    = { {90, 0} },
+        error      = { {120, 80}, {120, 80}, {120, 0} },
+        processing = { {40, 60}, {40, 0} },
+        notify     = { {35, 0} }
+    }
+    local steps = patterns[kind] or patterns.notify
+
+    local function runStep(i)
+        if i > #steps then return end
+        local step = steps[i]
+        pcall(function() vibrator.vibrate(step[1]) end)
+        if step[2] and step[2] > 0 then
+            local handler = Handler(Looper.getMainLooper())
+            handler.postDelayed(Runnable({ run = function() runStep(i + 1) end }), step[1] + step[2])
+        end
+    end
+    runStep(1)
 end
 
 function getGeminiApiKey() return aiPrefs.getString("gemini_apiKey", "") end
 function saveGeminiApiKey(key) aiEditor.putString("gemini_apiKey", key); aiEditor.commit() end
 function getSelectedLanguage() return aiPrefs.getString("selected_language", "English") end
 function saveSelectedLanguage(lang) aiEditor.putString("selected_language", lang); aiEditor.commit() end
-function getGeminiModel() return aiPrefs.getString("gemini_model", "Gemini 3.5 Flash") end
+function getGeminiModel() return aiPrefs.getString("gemini_model", "Gemini 3.8 Flash") end
 function saveGeminiModel(model) aiEditor.putString("gemini_model", model); aiEditor.commit() end
 function getSelectedRecognizeOption() return aiPrefs.getString("rec_option", "Analyze Image") end
 function saveSelectedRecognizeOption(opt) aiEditor.putString("rec_option", opt); aiEditor.commit() end
@@ -334,7 +615,7 @@ function pathToBase64(imagePath)
     options.inJustDecodeBounds = true
     BitmapFactory.decodeFile(imagePath, options)
     
-    local maxDimension = 1024
+    local maxDimension = CONFIG.MAX_IMAGE_DIMENSION
     local scale = 1
     if options.outHeight > maxDimension or options.outWidth > maxDimension then
         scale = math.max(math.floor(options.outHeight / maxDimension), math.floor(options.outWidth / maxDimension))
@@ -344,7 +625,10 @@ function pathToBase64(imagePath)
     options.inPreferredConfig = Bitmap.Config.RGB_565
     
     local bitmap = BitmapFactory.decodeFile(imagePath, options)
-    if not bitmap then return nil end
+    if not bitmap then
+        logError("pathToBase64: BitmapFactory.decodeFile returned nil for " .. tostring(imagePath))
+        return nil
+    end
     
     local width = bitmap.getWidth()
     local height = bitmap.getHeight()
@@ -357,23 +641,198 @@ function pathToBase64(imagePath)
             newHeight = maxDimension
             newWidth = (width * maxDimension / height)
         end
+        -- پرانا bitmap فوری طور پر ریسائیکل کریں تاکہ میموری فارغ ہو (کوئی لیک نہ رہے)
         local scaled = Bitmap.createScaledBitmap(bitmap, newWidth, newHeight, true)
         bitmap.recycle()
         bitmap = scaled
     end
     
     local outputStream = ByteArrayOutputStream()
-    bitmap.compress(Bitmap.CompressFormat.JPEG, 75, outputStream)
+    bitmap.compress(Bitmap.CompressFormat.JPEG, CONFIG.JPEG_QUALITY, outputStream)
     local imageBytes = outputStream.toByteArray()
     outputStream.close()
     bitmap.recycle()
+    collectgarbage("collect")
+    logInfo("pathToBase64: image encoded, size=" .. tostring(#imageBytes) .. " bytes")
     return Base64.encodeToString(imageBytes, Base64.NO_WRAP)
 end
 
+-- =====================================================================
+-- کیمرہ کیپچر — دوبارہ ڈیزائن شدہ (Content URI کا طریقہ)
+--
+-- پرانا مسئلہ: Uri.fromFile() سے بننے والا "file://" URI کیمرہ ایپ کو
+-- بھیجا جاتا تھا۔ Android 7 (API 24) سے، ایسا کوئی بھی URI جو آپ کی ایپ
+-- سے باہر (دوسری ایپ کو) بھیجا جائے، FileUriExposedException دیتا ہے —
+-- یہ ایک fatal/uncaught exception ہے جو پورے پراسیس کو کریش کر سکتا ہے،
+-- اور چونکہ یہ ایک Accessibility Service کے اندر ہو رہا تھا، بار بار
+-- کریش ہونے سے سسٹم اَنسٹیبل ہو کر ڈیوائس ری اسٹارٹ جیسا برتاؤ دکھا سکتا
+-- ہے۔ اوپر موجود StrictMode کوڈ اسے حل نہیں کرتا کیونکہ یہ چیک
+-- StrictMode کی پالیسی سے آزاد، فریم ورک میں خود بخود لاگو ہوتا ہے۔
+--
+-- نیا/محفوظ طریقہ: ContentResolver.insert() کے ذریعے براہِ راست
+-- MediaStore میں ایک نئی خالی entry بنائی جاتی ہے، جو ایک اصلی
+-- "content://" URI دیتی ہے — یہ کبھی FileUriExposedException نہیں دیتا
+-- اور کسی FileProvider/Manifest تبدیلی کی ضرورت نہیں پڑتی۔
+-- =====================================================================
+function createCameraOutputUri()
+    local ok, result = pcall(function()
+        local values = ContentValues()
+        values.put(MediaStore.Images.Media.DISPLAY_NAME, "CSR_AI_" .. os.time() .. ".jpg")
+        values.put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg")
+        local resolver = ctx.getContentResolver()
+        return resolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)
+    end)
+    if ok and result then
+        logInfo("createCameraOutputUri: created new MediaStore entry")
+        return result
+    end
+    logError("createCameraOutputUri failed: " .. tostring(result))
+    return nil
+end
+
+-- content:// URI سے براہِ راست بیس 64 حاصل کریں (کیمرے سے آنے والی تصویر کے لیے)
+function uriToBase64(uri)
+    local ok, result = pcall(function()
+        local resolver = ctx.getContentResolver()
+        local inputStream = resolver.openInputStream(uri)
+        if not inputStream then return nil end
+
+        local options = BitmapFactory.Options()
+        options.inPreferredConfig = Bitmap.Config.RGB_565
+        local bitmap = BitmapFactory.decodeStream(inputStream, nil, options)
+        pcall(function() inputStream.close() end)
+        if not bitmap then return nil end
+
+        local maxDimension = CONFIG.MAX_IMAGE_DIMENSION
+        local width = bitmap.getWidth()
+        local height = bitmap.getHeight()
+        if width > maxDimension or height > maxDimension then
+            local newWidth, newHeight = width, height
+            if width > height then
+                newWidth = maxDimension
+                newHeight = (height * maxDimension / width)
+            else
+                newHeight = maxDimension
+                newWidth = (width * maxDimension / height)
+            end
+            local scaled = Bitmap.createScaledBitmap(bitmap, newWidth, newHeight, true)
+            bitmap.recycle()
+            bitmap = scaled
+        end
+
+        local outputStream = ByteArrayOutputStream()
+        bitmap.compress(Bitmap.CompressFormat.JPEG, CONFIG.JPEG_QUALITY, outputStream)
+        local imageBytes = outputStream.toByteArray()
+        outputStream.close()
+        bitmap.recycle()
+        collectgarbage("collect")
+        return Base64.encodeToString(imageBytes, Base64.NO_WRAP)
+    end)
+    if ok and result then
+        logInfo("uriToBase64: image encoded from content URI")
+        return result
+    end
+    logError("uriToBase64 failed: " .. tostring(result))
+    return nil
+end
+
+-- موجودہ منتخب امیج (خواہ گیلری کا فائل پاتھ ہو یا کیمرے کا content URI)
+-- کو بیس 64 میں تبدیل کرتا ہے — Process بٹن اسی کو استعمال کرتا ہے۔
+function getSelectedImageBase64()
+    if selectedPhotoUri then
+        return uriToBase64(selectedPhotoUri)
+    elseif selectedPhotoPath and selectedPhotoPath ~= "" then
+        return pathToBase64(selectedPhotoPath)
+    end
+    return nil
+end
+
+-- Offline OCR کے لیے موجودہ منتخب امیج کا Bitmap حاصل کریں
+function decodeSelectedBitmap()
+    local ok, bmp = pcall(function()
+        if selectedPhotoUri then
+            local resolver = ctx.getContentResolver()
+            local inputStream = resolver.openInputStream(selectedPhotoUri)
+            if not inputStream then return nil end
+            local b = BitmapFactory.decodeStream(inputStream)
+            pcall(function() inputStream.close() end)
+            return b
+        elseif selectedPhotoPath and selectedPhotoPath ~= "" then
+            return BitmapFactory.decodeFile(selectedPhotoPath)
+        end
+        return nil
+    end)
+    if ok then return bmp end
+    logError("decodeSelectedBitmap failed: " .. tostring(bmp))
+    return nil
+end
+
+-- Safe Mode: لگاتار ناکامیوں کے بعد فیچر کو عارضی بند کرنا تاکہ ایپ کریش نہ ہو
+-- اور یوزر کو واضح پیغام ملے۔ کامیاب کال پر کاؤنٹر خودکار ری سیٹ ہو جاتا ہے۔
+function enterSafeModeIfNeeded()
+    runtimeState.consecutiveFailures = runtimeState.consecutiveFailures + 1
+    logWarn("Consecutive failure count: " .. runtimeState.consecutiveFailures)
+    if runtimeState.consecutiveFailures >= CONFIG.SAFE_MODE_FAILURE_THRESHOLD and not runtimeState.safeModeActive then
+        runtimeState.safeModeActive = true
+        logError("SAFE MODE ACTIVATED after " .. runtimeState.consecutiveFailures .. " consecutive failures.")
+        notify("Safe Mode فعال: بار بار ایرر آنے کی وجہ سے AI فیچر عارضی طور پر روکا گیا۔ Settings چیک کریں۔")
+    end
+end
+
+function resetFailureState()
+    if runtimeState.consecutiveFailures > 0 or runtimeState.safeModeActive then
+        logInfo("API call succeeded — resetting failure counter / leaving Safe Mode.")
+    end
+    runtimeState.consecutiveFailures = 0
+    runtimeState.safeModeActive = false
+end
+
+-- اندرونی: ایک ہی کوشش (attempt) کے لیے HTTP کال
+local function attemptGeminiCall(url, payload, attemptNumber, model, onDone)
+    local ok, err = pcall(function()
+        Http.post(url, cjson.encode(payload), { ["Content-Type"] = "application/json" }, function(status, data)
+            if status == 200 then
+                local decodeOk, decoded = pcall(cjson.decode, data)
+                if decodeOk and decoded and decoded.candidates and decoded.candidates[1] then
+                    local content = decoded.candidates[1].content
+                    if content and content.parts and content.parts[1] then
+                        onDone(content.parts[1].text, nil, false)
+                    else
+                        onDone(nil, "No text found in the image, or the API blocked the response (safety filters).", false)
+                    end
+                else
+                    onDone(nil, "Invalid / corrupt API response. The model might be temporarily unstable.", true)
+                end
+            elseif status == 404 then
+                -- غلط یا نان-ایگزسٹنٹ ماڈل آئی ڈی — دوبارہ کوشش کرنے کا فائدہ نہیں
+                onDone(nil, "Error 404: The selected model (" .. model .. ") is not available for your API key/region.", false)
+            elseif status == 429 then
+                onDone(nil, "Error 429: Rate limit / quota exceeded.", true)
+            elseif status >= 500 then
+                onDone(nil, "Server Error " .. status .. ": Gemini service temporarily unavailable.", true)
+            else
+                onDone(nil, "API Error: " .. status, false)
+            end
+        end)
+    end)
+    if not ok then
+        logError("attemptGeminiCall pcall failed: " .. tostring(err))
+        onDone(nil, "Network/Runtime error while calling API: " .. tostring(err), true)
+    end
+end
+
+-- عوامی فنکشن: خودکار ری-ٹرائی اور Safe Mode کے ساتھ Gemini کو امیج بھیجنا
 function callGeminiWithImage(apiKey, model, base64Data, prompt, callback)
+    if runtimeState.safeModeActive then
+        logWarn("callGeminiWithImage blocked: Safe Mode is active.")
+        callback(nil, "Safe Mode فعال ہے۔ بار بار ایرر کی وجہ سے AI عارضی طور پر بند ہے۔ کچھ دیر بعد یا Settings چیک کر کے دوبارہ کوشش کریں.")
+        return
+    end
+
     local modelInfo = geminiApiDetails[model]
     if not modelInfo then
-        if callback then callback(nil, "Invalid model selected") end
+        logError("callGeminiWithImage: invalid model '" .. tostring(model) .. "'")
+        callback(nil, "Invalid model selected")
         return
     end
     local url = "https://generativelanguage.googleapis.com/" .. modelInfo.version .. "/" .. modelInfo.id .. ":generateContent?key=" .. apiKey
@@ -385,27 +844,94 @@ function callGeminiWithImage(apiKey, model, base64Data, prompt, callback)
             }
         }}
     }
-    
-    Http.post(url, cjson.encode(payload), { ["Content-Type"] = "application/json" }, function(status, data)
-        if status == 200 then
-            local ok, decoded = pcall(cjson.decode, data)
-            if ok and decoded and decoded.candidates and decoded.candidates[1] then
-                local content = decoded.candidates[1].content
-                if content and content.parts and content.parts[1] then
-                    local result = content.parts[1].text
-                    callback(result, nil)
-                else
-                    callback(nil, "No text found in the image or API blocked the response.")
-                end
-            else
-                callback(nil, "Invalid API response. The model might be temporarily unstable.")
+
+    logInfo("Calling Gemini model=" .. model .. " url=" .. modelInfo.version .. "/" .. modelInfo.id)
+
+    local function tryAttempt(attemptNumber)
+        attemptGeminiCall(url, payload, attemptNumber, model, function(result, errMsg, retryable)
+            if result then
+                logInfo("Gemini call succeeded on attempt " .. attemptNumber)
+                resetFailureState()
+                callback(result, nil)
+                return
             end
-        elseif status == 404 then
-            callback(nil, "Error 404: The selected model (" .. model .. ") is not available or correct. Please ensure the model is supported by your key.")
-        else
-            callback(nil, "API Error: " .. status)
-        end
+
+            logError("Gemini call failed (attempt " .. attemptNumber .. "): " .. tostring(errMsg))
+
+            if retryable and attemptNumber <= CONFIG.MAX_RETRIES then
+                local handler = Handler(Looper.getMainLooper())
+                handler.postDelayed(Runnable({ run = function()
+                    tryAttempt(attemptNumber + 1)
+                end }), CONFIG.RETRY_DELAY_MS)
+            else
+                enterSafeModeIfNeeded()
+                callback(nil, errMsg)
+            end
+        end)
+    end
+
+    tryAttempt(1)
+end
+
+-- =====================================================================
+-- NETWORK CHECK + OFFLINE OCR FALLBACK
+-- انٹرنیٹ نہ ہونے کی صورت میں "Extract Text Only" موڈ کے لیے مقامی
+-- (آن-ڈیوائس) OCR آزمائی جاتی ہے۔ باقی موڈز (Analyze/Translate/Summarize)
+-- کو AI reasoning چاہیے، اس لیے وہ صرف انٹرنیٹ کے ساتھ ہی کام کریں گے۔
+--
+-- نوٹ: یہ Tesseract OCR کلاس (com.googlecode.tesseract.android.TessBaseAPI)
+-- استعمال کرتی ہے، جو صرف اسی صورت دستیاب ہوگی جب آپ کے AndroLua ایڈیشن
+-- میں یہ پلگ ان پہلے سے شامل ہو اور CONFIG.OCR_TESSDATA_DIR کے اندر
+-- "tessdata/eng.traineddata" فائل موجود ہو۔ اگر یہ کلاس یا فائل موجود نہ
+-- ہو تو ایپ کریش نہیں ہوگی — صرف واضح پیغام دے گی۔
+-- =====================================================================
+function isNetworkAvailable()
+    local ok, result = pcall(function()
+        local cm = ctx.getSystemService(Context.CONNECTIVITY_SERVICE)
+        if not cm then return true end
+        local network = cm.getActiveNetwork()
+        if not network then return false end
+        local capabilities = cm.getNetworkCapabilities(network)
+        if not capabilities then return false end
+        return capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
     end)
+    if ok then return result end
+    -- چیک ناکام ہونے کی صورت میں پرامی ٹیکل طور پر آن لائن فرض کریں
+    -- (تاکہ ایک غلط نیٹ ورک چیک کی وجہ سے فیچر مکمل بند نہ ہو جائے)
+    logWarn("isNetworkAvailable check failed, assuming online: " .. tostring(result))
+    return true
+end
+
+function tryOfflineOCR(callback)
+    logInfo("Attempting offline OCR fallback for current selection")
+    local ok, resultOrErr = pcall(function()
+        local TessBaseAPI_CLASS = luajava.bindClass("com.googlecode.tesseract.android.TessBaseAPI")
+        local tess = TessBaseAPI_CLASS()
+        local dataPath = (os.getenv("EXTERNAL_STORAGE") or "/sdcard") .. "/" .. CONFIG.OCR_TESSDATA_DIR
+        local initOk = tess.init(dataPath, CONFIG.OCR_LANGUAGE)
+        if not initOk then
+            pcall(function() tess.recycle() end)
+            error("Tesseract init failed — tessdata/" .. CONFIG.OCR_LANGUAGE .. ".traineddata missing?")
+        end
+        local bitmap = decodeSelectedBitmap()
+        if not bitmap then
+            pcall(function() tess.recycle() end)
+            error("Could not decode image for OCR")
+        end
+        tess.setImage(bitmap)
+        local text = tess.getUTF8Text()
+        tess.recycle()
+        bitmap.recycle()
+        return text
+    end)
+
+    if ok and resultOrErr and resultOrErr ~= "" then
+        logInfo("Offline OCR succeeded.")
+        callback(resultOrErr, nil)
+    else
+        logWarn("Offline OCR unavailable/failed: " .. tostring(resultOrErr))
+        callback(nil, "انٹرنیٹ دستیاب نہیں اور آفلائن OCR بھی اس ڈیوائس پر دستیاب/فعال نہیں ہے۔\n\nمشورہ: انٹرنیٹ کنکشن آن کر کے دوبارہ کوشش کریں، یا Tesseract OCR پلگ ان اور tessdata فائل انسٹال کریں۔")
+    end
 end
 
 function scanAllImages()
@@ -456,6 +982,7 @@ function scanAllImages()
         listView.setOnItemClickListener(AdapterView.OnItemClickListener{
             onItemClick = function(p, v, pos, id)
                 selectedPhotoPath = photoFilePaths[pos + 1]
+                selectedPhotoUri = nil
                 if _G.statusLabel then
                     _G.statusLabel.setText("Selected: " .. File_CLASS(selectedPhotoPath).getName())
                 end
@@ -466,6 +993,424 @@ function scanAllImages()
     else
         notify("No images found.")
     end
+end
+
+-- =====================================================================
+-- LIVE / CONTINUOUS MODE
+-- کیمرہ پریویو کھلا رکھ کر ہر چند سیکنڈ بعد ایک فریم خودکار طور پر
+-- Gemini کو بھیجا جاتا ہے اور مختصر جواب (جیسے "Path looks clear" یا
+-- "Person ahead") فوراً بولا جاتا ہے، تاکہ صارف چلتے ہوئے رہنمائی لے سکے۔
+--
+-- نوٹ برائے ڈویلپر:
+-- 1) یہ فیچر (deprecated مگر Lua/luajava سے آسانی سے قابلِ استعمال)
+--    android.hardware.Camera API استعمال کرتا ہے۔ اس کے لیے ایپ کو
+--    CAMERA permission خود حاصل ہونی چاہیے (یہ MediaStore انٹینٹ سے
+--    مختلف ہے، جہاں پرمیشن کیمرہ ایپ کے پاس ہوتی تھی)۔
+-- 2) ہر فریم پر Gemini API کال ہوتی ہے — یعنی ڈیٹا/API لاگت مسلسل
+--    استعمال ہوگی جب تک Live Mode بند نہ کیا جائے۔
+-- 3) اگر کیمرہ اوپن نہ ہو سکے (پرمیشن یا ہارڈویئر مسئلہ)، ایپ کریش
+--    ہونے کے بجائے واضح پیغام دکھائے گی۔
+-- =====================================================================
+-- =====================================================================
+-- MULTI-LANGUAGE SPEECH OUTPUT (برائے Live Mode) — سادہ اور قابلِ اعتماد
+--
+-- پہلے یہاں ایک بالکل نیا/الگ TextToSpeech انجن بنایا جاتا تھا جسے
+-- منتخب زبان کا اپنا وائس ڈیٹا الگ سے انسٹال ہونا ضروری تھا — یہی
+-- سب سے بڑی وجہ تھی کہ Live Mode "جواب نہیں دے رہا" محسوس ہوتا تھا۔
+--
+-- اب اس کے بجائے وہی service.speak() پائپ لائن استعمال ہوتی ہے جو
+-- پوری ایپ میں پہلے سے (Toast/notify کے ذریعے) کامیابی سے کام کر رہی
+-- ہے — یعنی آپ کی ڈیوائس کی موجودہ Accessibility/TalkBack آواز کا
+-- سیٹ اپ ہی استعمال ہوگا، کسی الگ زبان کی آواز انسٹال کرنے کی
+-- ضرورت نہیں۔ متن ہمیشہ منتخب زبان میں ہی بنایا جاتا ہے (Gemini
+-- prompt میں سختی سے طے ہے) — بولنے کے لیے صرف موجودہ سسٹم آواز
+-- استعمال ہوتی ہے، جو جو بھی زبان سپورٹ کرے وہ خود بخود صحیح تلفظ
+-- کرنے کی کوشش کرے گی۔
+-- =====================================================================
+local LANGUAGE_TO_LOCALE = {
+    ["English"] = {"en", "US"},
+    ["Urdu (اردو)"] = {"ur", "PK"},
+    ["Hindi (हिन्दी)"] = {"hi", "IN"},
+    ["Punjabi (پنجابی)"] = {"pa", "IN"},
+    ["Arabic (العربية)"] = {"ar", "SA"},
+    ["Pashto (پشتو)"] = {"ps", "AF"},
+    ["Sindhi (سنڌي)"] = {"sd", "IN"},
+    ["Persian (فارسی)"] = {"fa", "IR"},
+    ["Spanish (Español)"] = {"es", "ES"},
+    ["French (Français)"] = {"fr", "FR"},
+    ["German (Deutsch)"] = {"de", "DE"},
+    ["Chinese (中文)"] = {"zh", "CN"},
+    ["Russian (Русский)"] = {"ru", "RU"},
+    ["Japanese (日本語)"] = {"ja", "JP"},
+    ["Turkish (Türkçe)"] = {"tr", "TR"},
+    ["Bengali (বাংলা)"] = {"bn", "BD"},
+    ["Portuguese (Português)"] = {"pt", "PT"}
+}
+
+-- ڈیوائس کو Android کی سرکاری "Install/Update Voice Data" اسکرین پر بھیجتا ہے
+-- (اختیاری — بہتر تلفظ کے لیے، لازمی نہیں)
+function openTTSVoiceInstaller()
+    local ok, err = pcall(function()
+        local intent = Intent(TextToSpeech.Engine.ACTION_INSTALL_TTS_DATA)
+        intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        ctx.startActivity(intent)
+    end)
+    if not ok then
+        logError("openTTSVoiceInstaller failed: " .. tostring(err))
+        notify("Voice Install اسکرین نہیں کھل سکی")
+    end
+end
+
+-- موجودہ منتخب زبان میں متن بولتا ہے — بغیر کسی الگ وائس ڈیٹا انسٹال
+-- کیے، وہی طریقہ استعمال کرتے ہوئے جو باقی پوری ایپ میں کام کر رہا ہے۔
+function speakInSelectedLanguage(text)
+    if not text or text == "" then return end
+    local ok, err = pcall(function()
+        if service and service.speak then
+            service.speak(text)
+        end
+    end)
+    if not ok then
+        logError("speakInSelectedLanguage: service.speak failed: " .. tostring(err))
+    end
+    -- طویل جواب اسکرین پر بھی دکھا دیں (مختصر پیغام کے بجائے، تاکہ سکرین
+    -- ریڈر یا خود صارف اسے پڑھ/دیکھ سکے)
+    pcall(function()
+        Toast.makeText(ctx, text, Toast.LENGTH_LONG).show()
+    end)
+end
+
+function stopTTS()
+    -- سادہ کر دیا گیا: چونکہ اب کوئی الگ TextToSpeech انجن نہیں بنایا
+    -- جاتا، یہاں کچھ روکنے کی ضرورت نہیں۔ فنکشن مطابقت کے لیے رکھا گیا ہے۔
+end
+
+local liveModeState = {
+    active = false,
+    camera = nil,
+    busy = false,
+    lastFrameBase64 = nil   -- سب سے تازہ فریم — Voice Q&A کے لیے سیاق و سباق کے طور پر استعمال ہوگا
+}
+
+function stopLiveMode()
+    liveModeState.active = false
+    if liveModeState.camera then
+        pcall(function()
+            liveModeState.camera.setPreviewCallback(nil)
+            liveModeState.camera.stopPreview()
+            liveModeState.camera.release()
+        end)
+        liveModeState.camera = nil
+    end
+    stopTTS()
+    logInfo("Live Mode stopped.")
+end
+
+function nv21ToJpegBase64(data, camera)
+    local ok, result = pcall(function()
+        local params = camera.getParameters()
+        local size = params.getPreviewSize()
+        local yuvImage = YuvImage(data, ImageFormat.NV21, size.width, size.height, nil)
+        local out = ByteArrayOutputStream()
+        local rect = Rect(0, 0, size.width, size.height)
+        yuvImage.compressToJpeg(rect, CONFIG.JPEG_QUALITY, out)
+        local bytes = out.toByteArray()
+        out.close()
+        return Base64.encodeToString(bytes, Base64.NO_WRAP)
+    end)
+    if ok then return result end
+    logError("nv21ToJpegBase64 failed: " .. tostring(result))
+    return nil
+end
+
+function processLiveFrame(base64Data, statusTv)
+    liveModeState.lastFrameBase64 = base64Data  -- Voice Q&A کے لیے تازہ فریم محفوظ رکھیں
+
+    local apiKey = getGeminiApiKey()
+    if not apiKey or apiKey == "" then
+        if statusTv then statusTv.setText("API Key missing — open Settings first.") end
+        return
+    end
+    liveModeState.busy = true
+    vibratePattern("processing")
+    local lang = getSelectedLanguage()
+    local prompt = "Reply in exactly ONE short, natural, spoken-style sentence (max 12 words). Describe anything important directly ahead for a visually impaired person walking: people, obstacles, stairs, vehicles, doors, or hazards. If the path is clear, say so — in " .. lang .. ". IMPORTANT: your entire reply must be written ONLY in " .. lang .. ". Do not use English or any other language, not even a single word (unless " .. lang .. " itself is English). Do not add labels, quotes, or any extra text — output only the spoken sentence."
+    callGeminiWithImage(apiKey, getGeminiModel(), base64Data, prompt, function(res, err)
+        liveModeState.busy = false
+        if res then
+            if statusTv then pcall(function() statusTv.setText(res) end) end
+            speakInSelectedLanguage(res)
+            saveHistoryEntry("Live Mode (" .. lang .. ")", res)
+        else
+            logError("Live frame error: " .. tostring(err))
+        end
+    end)
+end
+
+-- =====================================================================
+-- VOICE Q&A (Live Mode کے دوران) — "Press & Ask" طرز
+--
+-- نوٹ: یہ ایک اصلی مسلسل/live فون کال جیسی گفتگو نہیں ہے (وہ Gemini کے
+-- الگ streaming/WebSocket-based Live API کے بغیر اس REST سیٹ اپ میں
+-- قابلِ اعتماد طریقے سے نہیں بن سکتی)۔ بجائے اس کے، یہ "دبائیں اور
+-- پوچھیں" طرز کا نظام ہے: بٹن دبائیں → سوال بولیں → موجودہ کیمرہ فریم
+-- کے سیاق و سباق کے ساتھ Gemini سے مختصر جواب → جواب بولا جاتا ہے۔
+--
+-- RECORD_AUDIO پرمیشن ایپ کے پاس ہونی چاہیے (کیمرہ پرمیشن جیسا مسئلہ
+-- ہو سکتا ہے)۔ ناکامی کی صورت میں واضح پیغام ملے گا، کریش نہیں ہوگا۔
+-- =====================================================================
+function askGeminiFollowUp(question, statusTv)
+    local apiKey = getGeminiApiKey()
+    if not apiKey or apiKey == "" then
+        notify("API Key missing! پہلے Settings میں سیٹ کریں")
+        return
+    end
+    if not liveModeState.lastFrameBase64 then
+        notify("ابھی کوئی کیمرہ فریم دستیاب نہیں، چند سیکنڈ بعد دوبارہ کوشش کریں")
+        return
+    end
+
+    vibratePattern("processing")
+    local lang = getSelectedLanguage()
+    local prompt = "You are a helpful, knowledgeable voice assistant for a visually impaired user, talking with them by voice. They just asked, by voice: \"" .. question .. "\". " ..
+        "If their question relates to what is currently visible in the attached camera image, use the image to answer accurately. " ..
+        "If it is a general question unrelated to the image (facts, advice, explanations, calculations, definitions, translations, how-to help, conversation, or anything else), just answer it directly and helpfully like a normal AI assistant would — do not force a connection to the image. " ..
+        "Give a clear, complete, natural-sounding spoken answer (a few sentences if needed, as long as it fully answers the question). " ..
+        "IMPORTANT: your entire reply must be written ONLY in " .. lang .. ". Do not use English or any other language, not even a single word, unless " .. lang .. " itself is English."
+
+    callGeminiWithImage(apiKey, getGeminiModel(), liveModeState.lastFrameBase64, prompt, function(res, err)
+        if res then
+            if statusTv then pcall(function() statusTv.setText("Q: " .. question .. "\n\nA: " .. res) end) end
+            speakInSelectedLanguage(res)
+            saveHistoryEntry("Live Q&A (" .. lang .. ")", question .. " → " .. res)
+        else
+            logError("Live Q&A error: " .. tostring(err))
+            vibratePattern("error")
+            notify("جواب نہیں مل سکا: " .. tostring(err))
+        end
+    end)
+end
+
+-- SpeechRecognizer کے ایرر کوڈز کو واضح، قابلِ فہم اردو پیغامات میں بدلتا ہے
+function describeSpeechError(code)
+    local messages = {
+        [1] = "نیٹ ورک بہت سست ہے، دوبارہ کوشش کریں۔",
+        [2] = "انٹرنیٹ کنکشن کا مسئلہ ہے۔",
+        [3] = "Microphone میں مسئلہ ہوا۔",
+        [4] = "سرور کا مسئلہ، دوبارہ کوشش کریں۔",
+        [5] = "کوئی اندرونی خرابی ہوئی۔",
+        [6] = "آپ نے کچھ بولا نہیں، یا بہت دیر لگا دی۔",
+        [7] = "آواز سمجھ نہیں آئی، دوبارہ صاف الفاظ میں بولیں۔",
+        [8] = "پہلے سے ایک درخواست چل رہی ہے، تھوڑا انتظار کریں۔",
+        [9] = "Microphone پرمیشن نہیں ملی۔ App Settings میں جا کر Microphone پرمیشن آن کریں۔",
+        [10] = "بہت زیادہ درخواستیں — تھوڑا انتظار کریں۔",
+        [11] = "سرور سے کنکشن ٹوٹ گیا۔",
+        [12] = "یہ زبان اس ڈیوائس پر آواز پہچاننے کے لیے سپورٹڈ نہیں۔",
+        [13] = "یہ زبان فی الحال دستیاب نہیں۔"
+    }
+    return messages[code] or ("آواز سمجھنے میں مسئلہ ہوا (کوڈ " .. tostring(code) .. ")۔")
+end
+
+function hasRecordAudioPermission()
+    local ok, result = pcall(function()
+        return ctx.checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
+    end)
+    if ok then return result end
+    return true -- چیک ناکام ہونے کی صورت میں کوشش کرنے دیں، اصل ایرر SpeechRecognizer خود دے دے گا
+end
+
+-- بولے گئے سوال کو سنتا ہے۔ اگر منتخب زبان آواز-شناخت کے لیے سپورٹڈ نہ
+-- ہو (ایرر 12/13)، تو خودکار طور پر ڈیوائس کی ڈیفالٹ زبان کے ساتھ ایک
+-- بار دوبارہ کوشش کرتا ہے — تاکہ صارف کو صرف "کام نہیں کر رہا" کے
+-- بجائے کوئی نتیجہ ملے۔
+function askQuestionInLiveMode(statusTv, useDeviceDefaultLocale, attemptNumber)
+    attemptNumber = attemptNumber or 1
+
+    if not hasRecordAudioPermission() then
+        vibratePattern("error")
+        notify("Microphone پرمیشن نہیں ملی۔ براہِ کرم App Settings میں جا کر Microphone پرمیشن آن کریں۔")
+        return
+    end
+
+    -- SpeechRecognizer کو ہمیشہ Main/UI Thread (جس کا اپنا Looper ہو) پر
+    -- ہی بنانا اور چلانا ضروری ہے — بصورتِ دیگر یہ خاموشی سے ناکام ہو
+    -- جاتا ہے۔ چونکہ ہمیں یقین نہیں کہ بٹن کلک کس تھریڈ پر آتا ہے، اسے
+    -- جبراً Main Looper پر بھیجا جا رہا ہے۔
+    local handler = Handler(Looper.getMainLooper())
+    handler.post(Runnable({ run = function()
+        local ok, err = pcall(function()
+            if not SpeechRecognizer.isRecognitionAvailable(ctx) then
+                error("Speech recognition not available on this device")
+            end
+
+            local recognizer = SpeechRecognizer.createSpeechRecognizer(ctx)
+            if not recognizer then
+                error("SpeechRecognizer.createSpeechRecognizer returned nil")
+            end
+
+            local recIntent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH)
+            recIntent.putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+            recIntent.putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
+            recIntent.putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 3)
+            -- زیادہ وقت دیں تاکہ بولتے ہوئے جلدی نہ کٹے
+            pcall(function() recIntent.putExtra("android.speech.extra.SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS", 1800) end)
+            pcall(function() recIntent.putExtra("android.speech.extra.SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS", 1800) end)
+            pcall(function() recIntent.putExtra("android.speech.extra.SPEECH_INPUT_MINIMUM_LENGTH_MILLIS", 15000) end)
+
+            if not useDeviceDefaultLocale then
+                local localeInfo = LANGUAGE_TO_LOCALE[getSelectedLanguage()] or LANGUAGE_TO_LOCALE["English"]
+                recIntent.putExtra(RecognizerIntent.EXTRA_LANGUAGE, localeInfo[1] .. "-" .. localeInfo[2])
+            end
+
+            recognizer.setRecognitionListener(RecognitionListener{
+            onReadyForSpeech = function(params)
+                if statusTv then pcall(function() statusTv.setText("🎤 سنیے... اب بولیں") end) end
+            end,
+            onBeginningOfSpeech = function()
+                if statusTv then pcall(function() statusTv.setText("🎤 سن رہا ہوں...") end) end
+            end,
+            onRmsChanged = function(rmsdB) end,
+            onBufferReceived = function(buffer) end,
+            onEndOfSpeech = function()
+                if statusTv then pcall(function() statusTv.setText("سوچ رہا ہوں...") end) end
+            end,
+            onResults = function(results)
+                local ok2, err2 = pcall(function()
+                    local matches = results.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
+                    if matches and matches.size() > 0 then
+                        local question = matches.get(0)
+                        logInfo("Voice question recognized: " .. tostring(question))
+                        askGeminiFollowUp(question, statusTv)
+                    else
+                        vibratePattern("error")
+                        notify("کچھ سمجھ نہیں آیا، دوبارہ کوشش کریں")
+                    end
+                end)
+                if not ok2 then logError("onResults handling failed: " .. tostring(err2)) end
+                pcall(function() recognizer.destroy() end)
+            end,
+            onError = function(errorCode)
+                logWarn("SpeechRecognizer error code: " .. tostring(errorCode))
+                pcall(function() recognizer.destroy() end)
+
+                -- اگر منتخب زبان آواز شناخت کے لیے سپورٹڈ نہیں (12/13) تو ڈیوائس
+                -- کی ڈیفالٹ زبان کے ساتھ خودکار طور پر ایک بار دوبارہ کوشش کریں
+                if (errorCode == 12 or errorCode == 13) and attemptNumber == 1 and not useDeviceDefaultLocale then
+                    logInfo("Retrying speech recognition with device default locale.")
+                    if statusTv then pcall(function() statusTv.setText("اس زبان میں آواز شناخت دستیاب نہیں — ڈیوائس کی ڈیفالٹ زبان سے دوبارہ کوشش ہو رہی ہے...") end) end
+                    askQuestionInLiveMode(statusTv, true, 2)
+                else
+                    vibratePattern("error")
+                    -- خرابی کا صاف مطلب + اصل کوڈ، دونوں دکھائیں (بگ رپورٹ کرنا آسان ہو)
+                    notify(describeSpeechError(errorCode) .. " [code:" .. tostring(errorCode) .. "]")
+                    if statusTv then pcall(function() statusTv.setText(describeSpeechError(errorCode) .. " (error code " .. tostring(errorCode) .. ")") end) end
+                end
+            end,
+            onPartialResults = function(partialResults)
+                local ok3, question = pcall(function()
+                    local matches = partialResults.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
+                    if matches and matches.size() > 0 then return matches.get(0) end
+                    return nil
+                end)
+                if ok3 and question and statusTv then
+                    pcall(function() statusTv.setText("🎤 " .. question) end)
+                end
+            end,
+            onEvent = function(eventType, params) end
+        })
+
+            vibratePattern("notify")
+            recognizer.startListening(recIntent)
+        end)
+
+        if not ok then
+            logError("askQuestionInLiveMode failed: " .. tostring(err))
+            vibratePattern("error")
+            notify("Voice سوال شروع نہیں ہو سکا — تفصیل: " .. tostring(err))
+            if statusTv then pcall(function() statusTv.setText("Voice error: " .. tostring(err)) end) end
+        end
+    end }))
+end
+
+function startLiveMode()
+    if liveModeState.active then
+        notify("Live Mode پہلے سے چل رہا ہے")
+        return
+    end
+    if mainDlg then mainDlg.dismiss() mainDlg = nil end
+
+    local liveLayout = LinearLayout(ctx)
+    liveLayout.setOrientation(1)
+
+    local surfaceView = SurfaceView(ctx)
+    surfaceView.setLayoutParams(LinearLayout.LayoutParams(-1, dp(280)))
+    liveLayout.addView(surfaceView)
+
+    local statusTv = TextView(ctx)
+    statusTv.setText("Starting camera...")
+    statusTv.setGravity(Gravity.CENTER)
+    statusTv.setPadding(20, 20, 20, 20)
+    liveLayout.addView(statusTv)
+
+    -- Voice Q&A بٹن — دبائیں، سوال بولیں، موجودہ منظر کے مطابق جواب سنیں
+    local btnAsk = Button(ctx)
+    btnAsk.setText("🎤 ASK A QUESTION")
+    btnAsk.setBackgroundColor(0xFF4CAF50)
+    btnAsk.setTextColor(0xFFFFFFFF)
+    btnAsk.onClick = function() askQuestionInLiveMode(statusTv) end
+    liveLayout.addView(btnAsk)
+
+    local liveDlg = LuaDialog(ctx)
+    liveDlg.setTitle("Live Navigation Mode — " .. getSelectedLanguage() .. " (every " .. (CONFIG.LIVE_MODE_INTERVAL_MS / 1000) .. "s)")
+    liveDlg.setView(liveLayout)
+    liveDlg.setCancelable(false)
+    liveDlg.setNegativeButton("Stop", function()
+        stopLiveMode()
+        notify("Live Mode بند کر دیا گیا")
+        createMainUI()
+    end)
+    liveDlg.show()
+
+    local holder = surfaceView.getHolder()
+    holder.addCallback(SurfaceHolder.Callback{
+        surfaceCreated = function(h)
+            local ok, err = pcall(function()
+                liveModeState.camera = Camera.open()
+                liveModeState.camera.setPreviewDisplay(h)
+                liveModeState.camera.startPreview()
+                liveModeState.active = true
+                statusTv.setText("Live Mode active — describing surroundings every " .. (CONFIG.LIVE_MODE_INTERVAL_MS / 1000) .. "s")
+                logInfo("Live Mode camera started.")
+
+                local function scheduleNext()
+                    if not liveModeState.active then return end
+                    local handler = Handler(Looper.getMainLooper())
+                    handler.postDelayed(Runnable({ run = function()
+                        if not liveModeState.active or not liveModeState.camera then return end
+                        if not liveModeState.busy then
+                            pcall(function()
+                                liveModeState.camera.setOneShotPreviewCallback(Camera.PreviewCallback{
+                                    onPreviewFrame = function(data, cam)
+                                        local b64 = nv21ToJpegBase64(data, cam)
+                                        if b64 then processLiveFrame(b64, statusTv) end
+                                    end
+                                })
+                            end)
+                        end
+                        scheduleNext()
+                    end }), CONFIG.LIVE_MODE_INTERVAL_MS)
+                end
+                scheduleNext()
+            end)
+            if not ok then
+                logError("Live Mode camera failed to start: " .. tostring(err))
+                statusTv.setText("Camera دستیاب نہیں۔ App Settings میں جا کر Camera permission دیں اور دوبارہ کوشش کریں۔")
+                notify("Camera access failed. براہ کرم App Settings میں Camera permission چیک کریں۔")
+            end
+        end,
+        surfaceChanged = function(h, format, w, hgt) end,
+        surfaceDestroyed = function(h) stopLiveMode() end
+    })
 end
 
 function showResultDialog(title, content)
@@ -488,11 +1433,21 @@ function showResultDialog(title, content)
         vibrate()
     end)
     resultDlg.setNegativeButton("Share", function()
-        local shareIntent = Intent(Intent.ACTION_SEND)
-        shareIntent.setType("text/plain")
-        shareIntent.putExtra(Intent.EXTRA_TEXT, content)
-        ctx.startActivity(Intent.createChooser(shareIntent, "Share via"))
-        vibrate()
+        local ok, err = pcall(function()
+            local shareIntent = Intent(Intent.ACTION_SEND)
+            shareIntent.setType("text/plain")
+            shareIntent.putExtra(Intent.EXTRA_TEXT, content)
+            local chooser = Intent.createChooser(shareIntent, "Share via")
+            chooser.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            ctx.startActivity(chooser)
+        end)
+        if ok then
+            vibratePattern("success")
+        else
+            logError("Share (result dialog) failed: " .. tostring(err))
+            vibratePattern("error")
+            notify("Share نہیں ہو سکا: " .. tostring(err))
+        end
     end)
     resultDlg.show()
 end
@@ -547,8 +1502,17 @@ function showAISettingsDialog()
     createBtn.setText("Create API Key")
     createBtn.setLayoutParams(LinearLayout.LayoutParams(0, -2, 1))
     createBtn.onClick = function()
-        local url = "https://aistudio.google.com/app/apikey"
-        ctx.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)))
+        local ok, err = pcall(function()
+            local url = "https://aistudio.google.com/app/apikey"
+            local intent = Intent(Intent.ACTION_VIEW, Uri.parse(url))
+            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            ctx.startActivity(intent)
+        end)
+        if not ok then
+            logError("Create API Key browser open failed: " .. tostring(err))
+            notify("Browser نہیں کھل سکا")
+            return
+        end
         notify("Opening browser to create API Key...")
         settingsDlg.dismiss()
         if mainDlg then 
@@ -647,12 +1611,20 @@ function showFeedbackForm()
         end
         local message = "Feedback from " .. name .. "\nWhatsApp: " .. whatsapp .. "\n\nFeedback:\n" .. feedback
         local encoded = URLEncoder.encode(message, "UTF-8")
-        local devNumber = "923057040811"
+        local devNumber = CONFIG.DEV_WHATSAPP_NUMBER
         local url = "https://wa.me/" .. devNumber .. "?text=" .. encoded
-        local intent = Intent(Intent.ACTION_VIEW, Uri.parse(url))
-        ctx.startActivity(intent)
+        local ok, err = pcall(function()
+            local intent = Intent(Intent.ACTION_VIEW, Uri.parse(url))
+            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            ctx.startActivity(intent)
+        end)
         feedbackDlg.dismiss()
-        notify("Opening WhatsApp to send feedback")
+        if ok then
+            notify("Opening WhatsApp to send feedback")
+        else
+            logError("Feedback WhatsApp intent failed: " .. tostring(err))
+            notify("WhatsApp نہیں کھل سکا")
+        end
     end
     
     feedbackDlg.show()
@@ -673,7 +1645,7 @@ function aboutAndSupport()
     mainLayout.setPadding(dp(16), dp(16), dp(16), dp(16))
     
     local titleView = TextView(ctx)
-    titleView.setText("CSR AI Vision Assistant (V 1.2)")
+    titleView.setText("CSR AI Vision Assistant")
     titleView.setTextSize(20)
     titleView.setTextColor(0xFF2196F3)
     titleView.setGravity(Gravity.CENTER)
@@ -710,13 +1682,26 @@ function aboutAndSupport()
     local descText = TextView(ctx)
     descText.setText(
         "CSR AI Vision Assistant is a powerful Android accessibility tool that leverages Google Gemini AI to help visually impaired users understand their surroundings.\n\n" ..
-        "--- WHAT'S NEW IN V 1.2 ---\n" ..
-        "• Completely resolved UI and ScrollView issues for Android 8, 9, and 10 devices, ensuring all options are fully visible and perfectly accessible.\n" ..
-        "• Better UI updates and overall visual enhancements.\n" ..
-        "• Added highly advanced 'Summarize Document' mode. It now extracts key entities (Dates, Prices, Names) and provides Actionable Insights in a structured format.\n" ..
-        "• Introduced Gemini 3.1 Flash Lite model for optimized performance.\n" ..
-        "• Fixed 'Create API Key' functionality to directly route you to the browser and close all dialogue boxes for an uninterrupted experience.\n" ..
-        "• Improved Gemini 3.7 model stability.\n" ..
+        "--- FEATURES ADDED SO FAR ---\n" ..
+        "• Choose From Gallery: pick any photo for Analyze / Extract Text / Translate / Summarize.\n" ..
+        "• Current Screen & Current Item: describes what's on screen or under screen-reader focus.\n" ..
+        "• Live Navigation Mode: real-time camera preview that automatically describes your surroundings every few seconds, speaking in your selected language.\n" ..
+        "• Voice Q&A in Live Mode: tap 'Ask a Question', speak naturally, and get a spoken answer — works for any kind of question, not just what's visible in the camera.\n" ..
+        "• Answers are generated strictly in whichever of the 17 supported languages you select (Urdu, Hindi, Punjabi, English, and more).\n" ..
+        "• Vibration feedback patterns for success / error / processing, so you know what's happening without looking at the screen.\n" ..
+        "• History: automatically saves your past results so you can revisit or re-listen to them anytime.\n" ..
+        "• Offline OCR fallback for 'Extract Text Only' when no internet is available (requires the Tesseract OCR plugin to be present).\n" ..
+        "• Automatic retries and a Safe Mode fallback if the AI service repeatedly fails, so the app degrades gracefully instead of getting stuck.\n" ..
+        "• Local activity logging for easier troubleshooting.\n\n" ..
+        "--- BUGS FIXED ---\n" ..
+        "• Fixed a crash in the old in-app camera-photo capture caused by an unsafe file:// link being passed to the camera app.\n" ..
+        "• Fixed Share/Log-sharing not working, caused by a missing required flag when opening share screens from the background service.\n" ..
+        "• Fixed Live Mode replies sometimes coming out in English even when another language was selected, caused by wording in the AI prompt.\n" ..
+        "• Fixed Live Mode voice output depending on separately-installed voice packs — voice replies now use the device's already-configured accessibility voice, no extra install needed.\n" ..
+        "• Fixed voice question input not responding, caused by voice recognition being started off the required main thread.\n" ..
+        "• Removed the in-app camera-photo and log-share buttons entirely, since they were unreliable — use 'CHOOSE FROM GALLERY' for image analysis instead.\n\n" ..
+        "--- NOT INCLUDED (BY DESIGN) ---\n" ..
+        "• A fully continuous, always-listening voice call with the AI (like a live phone call) is not included — this would need a different real-time streaming AI connection. Instead, Live Mode uses a 'press and ask' voice question system, which works with the AI setup this app uses.\n" ..
         "---------------------------\n\n" ..
         "How to use 'Summarize Document':\n" ..
         "Select the 6th option ('Summarize Document'), pick an image of a complex letter, bill, or notice, and hit Process. The AI will provide a clean Executive Summary, list down crucial information, and suggest next steps.\n\n" ..
@@ -750,7 +1735,15 @@ function aboutAndSupport()
             dialog.dismiss()
             if mainDlg then mainDlg.dismiss() end
             local url = "https://whatsapp.com/channel/0029VbCJfWSAojYuaMuB9E1t"
-            ctx.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)))
+            local ok, err = pcall(function()
+                local intent = Intent(Intent.ACTION_VIEW, Uri.parse(url))
+                intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                ctx.startActivity(intent)
+            end)
+            if not ok then
+                logError("Link open failed: " .. tostring(err))
+                notify("Link نہیں کھل سکا")
+            end
         end
     })
     mainLayout.addView(btnChannel)
@@ -764,8 +1757,16 @@ function aboutAndSupport()
         onClick = function()
             dialog.dismiss()
             if mainDlg then mainDlg.dismiss() end
-            local url = "https://chat.whatsapp.com/ItdQOG8lw5E6DKsxx9iNSd"
-            ctx.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)))
+            local url = "https://chat.whatsapp.com/C5jA2u0gGDO9rkgcCY2ybg"
+            local ok, err = pcall(function()
+                local intent = Intent(Intent.ACTION_VIEW, Uri.parse(url))
+                intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                ctx.startActivity(intent)
+            end)
+            if not ok then
+                logError("Link open failed: " .. tostring(err))
+                notify("Link نہیں کھل سکا")
+            end
         end
     })
     mainLayout.addView(btnCommunity)
@@ -780,7 +1781,15 @@ function aboutAndSupport()
             dialog.dismiss()
             if mainDlg then mainDlg.dismiss() end
             local url = "https://chat.whatsapp.com/Fsxp8fw3iM0KbzTPee9yRb"
-            ctx.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)))
+            local ok, err = pcall(function()
+                local intent = Intent(Intent.ACTION_VIEW, Uri.parse(url))
+                intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                ctx.startActivity(intent)
+            end)
+            if not ok then
+                logError("Link open failed: " .. tostring(err))
+                notify("Link نہیں کھل سکا")
+            end
         end
     })
     mainLayout.addView(btnGamingClub)
@@ -795,7 +1804,15 @@ function aboutAndSupport()
             dialog.dismiss()
             if mainDlg then mainDlg.dismiss() end
             local url = "https://youtube.com/@csr-official-f5v?si=nwBIaiiFoI8Ix8k5"
-            ctx.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)))
+            local ok, err = pcall(function()
+                local intent = Intent(Intent.ACTION_VIEW, Uri.parse(url))
+                intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                ctx.startActivity(intent)
+            end)
+            if not ok then
+                logError("Link open failed: " .. tostring(err))
+                notify("Link نہیں کھل سکا")
+            end
         end
     })
     mainLayout.addView(btnYoutube)
@@ -894,6 +1911,21 @@ function createMainUI()
     btnScan.onClick = function() scanAllImages() end
     layout.addView(btnScan)
     
+    -- Live/Continuous Mode بٹن
+    local btnLiveMode = Button(ctx)
+    btnLiveMode.setText("START LIVE MODE (Continuous)")
+    btnLiveMode.setBackgroundColor(0xFF2196F3)
+    btnLiveMode.setTextColor(0xFFFFFFFF)
+    btnLiveMode.onClick = function()
+        local apiKey = getGeminiApiKey()
+        if not apiKey or apiKey == "" then
+            notify("API Key missing! پہلے Settings میں سیٹ کریں")
+            return
+        end
+        startLiveMode()
+    end
+    layout.addView(btnLiveMode)
+    
     _G.statusLabel = TextView(ctx)
     _G.statusLabel.setText("No file selected")
     _G.statusLabel.setPadding(0, 20, 0, 20)
@@ -941,6 +1973,7 @@ function createMainUI()
     processButton.onClick = function()
         processButton.setEnabled(false)
         processButton.setText("Processing...")
+        vibratePattern("processing")
         
         local selectedOption = getSelectedRecognizeOption()
         local lang = getSelectedLanguage()
@@ -951,6 +1984,8 @@ function createMainUI()
             handler.postDelayed(Runnable({ run = function()
                 local result = analyzeCurrentScreen()
                 showResultDialog("Screen Analysis", result)
+                saveHistoryEntry("Current Screen", result)
+                vibratePattern("success")
                 processButton.setEnabled(true); processButton.setText("Process"); processButton.setBackgroundColor(0xFFFF9800)
             end }), 100)
         elseif selectedOption == "Current Item" then
@@ -959,27 +1994,58 @@ function createMainUI()
             handler.postDelayed(Runnable({ run = function()
                 local result = analyzeCurrentItem()
                 showResultDialog("Item Analysis", result)
+                saveHistoryEntry("Current Item", result)
+                vibratePattern("success")
                 processButton.setEnabled(true); processButton.setText("Process"); processButton.setBackgroundColor(0xFFFF9800)
             end }), 100)
         elseif selectedOption == "Analyze Image" or selectedOption == "Extract Text Only" or selectedOption == "Translate Image Text" or selectedOption == "Summarize Document" then
-            if selectedPhotoPath == "" then
+            if selectedPhotoPath == "" and not selectedPhotoUri then
+                vibratePattern("error")
                 notify("Please select an image first")
                 processButton.setEnabled(true); processButton.setText("Process"); processButton.setBackgroundColor(0xFFFF9800)
                 return
             end
             local apiKey = getGeminiApiKey()
             if not apiKey or apiKey == "" then
+                vibratePattern("error")
                 notify("API Key missing! Set in Settings")
                 processButton.setEnabled(true); processButton.setText("Process"); processButton.setBackgroundColor(0xFFFF9800)
+                return
+            end
+
+            -- انٹرنیٹ چیک: نہ ہونے کی صورت میں صرف "Extract Text Only" کے لیے
+            -- آفلائن OCR آزمائی جاتی ہے، باقی موڈز کو AI reasoning کی وجہ سے
+            -- لازمی انٹرنیٹ چاہیے ہوتا ہے۔
+            if not isNetworkAvailable() then
+                if selectedOption == "Extract Text Only" then
+                    showProgress("انٹرنیٹ نہیں ملا — Offline OCR آزمایا جا رہا ہے...")
+                    tryOfflineOCR(function(res, err)
+                        hideProgress()
+                        if res then
+                            showResultDialog("Offline OCR Result", res)
+                            saveHistoryEntry("Extract Text Only (Offline)", res)
+                            vibratePattern("success")
+                        else
+                            vibratePattern("error")
+                            notify(err or "Offline OCR failed")
+                        end
+                        processButton.setEnabled(true); processButton.setText("Process"); processButton.setBackgroundColor(0xFFFF9800)
+                    end)
+                else
+                    vibratePattern("error")
+                    notify("انٹرنیٹ کنکشن نہیں ہے۔ اس موڈ کے لیے انٹرنیٹ ضروری ہے۔")
+                    processButton.setEnabled(true); processButton.setText("Process"); processButton.setBackgroundColor(0xFFFF9800)
+                end
                 return
             end
             
             showProgress("Processing image with " .. getGeminiModel() .. "...")
             
-            local base64Data = pathToBase64(selectedPhotoPath)
+            local base64Data = getSelectedImageBase64()
             if not base64Data then
                 hideProgress()
-                notify("Failed to process image")
+                vibratePattern("error")
+                notify("Failed to process image. It might be deleted or unavailable.")
                 processButton.setEnabled(true); processButton.setText("Process"); processButton.setBackgroundColor(0xFFFF9800)
                 return
             end
@@ -999,7 +2065,10 @@ function createMainUI()
                 hideProgress()
                 if res then
                     showResultDialog("Analysis Result", res)
+                    saveHistoryEntry(selectedOption, res)
+                    vibratePattern("success")
                 else
+                    vibratePattern("error")
                     notify("Error: " .. (err or "Unknown"))
                 end
                 processButton.setEnabled(true); processButton.setText("Process"); processButton.setBackgroundColor(0xFFFF9800)
@@ -1030,16 +2099,26 @@ function createMainUI()
     btnExit.setLayoutParams(LinearLayout.LayoutParams(0, -2, 1))
     btnExit.setBackgroundColor(0xFFF44336)
     btnExit.onClick = function()
+        pcall(function() stopLiveMode() end)
         if mainDlg then mainDlg.dismiss() mainDlg = nil end
     end
     bottomLayout.addView(btnExit)
     
     layout.addView(bottomLayout)
+
+    -- محفوظ شدہ نتائج دیکھنے کا بٹن (History System)
+    local btnHistory = Button(ctx)
+    btnHistory.setText("History")
+    btnHistory.setLayoutParams(LinearLayout.LayoutParams(-1, -2))
+    btnHistory.setPadding(0, 10, 0, 0)
+    btnHistory.onClick = function() showHistoryDialog() end
+    layout.addView(btnHistory)
     
     mainDlg = LuaDialog(ctx)
-    mainDlg.setTitle("CSR AI Vision Assistant V1.2")
+    mainDlg.setTitle("CSR AI Vision Assistant")
     mainDlg.setView(scrollMain)
     mainDlg.show()
 end
 
+logInfo("CSR AI Vision Assistant started. Model=" .. getGeminiModel() .. " Language=" .. getSelectedLanguage())
 createMainUI()
