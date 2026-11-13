@@ -32,6 +32,13 @@ import "android.content.ContentValues"
 import "java.util.zip.ZipOutputStream"
 import "java.util.zip.ZipEntry"
 import "java.util.zip.ZipInputStream"
+import "java.net.URL"
+import "java.io.OutputStreamWriter"
+import "java.io.FileInputStream"
+import "java.io.BufferedReader"
+import "java.io.InputStreamReader"
+import "java.nio.channels.Channels"
+import "java.util.Arrays"
 import "android.speech.tts.TextToSpeech"
 import "java.util.Locale"
 import "android.speech.SpeechRecognizer"
@@ -232,6 +239,7 @@ function loadHistory()
 end
 
 function saveHistoryEntry(mode, resultText)
+    if not isSaveHistoryEnabled() then return end   -- پرائیویسی ٹوگل: بند ہو تو کچھ محفوظ نہیں ہوتا
     if not historyFilePath or not resultText or resultText == "" then return end
     pcall(function()
         local history = loadHistory()
@@ -271,7 +279,7 @@ function exportHistoryAsText()
     return table.concat(lines, "\n---------------------------\n\n")
 end
 
-function shareHistory()
+function shareHistory(histDlg)
     local text = exportHistoryAsText()
     if not text then
         notify("کوئی محفوظ شدہ نتیجہ نہیں ہے")
@@ -280,20 +288,7 @@ function shareHistory()
     if #text > 30000 then
         text = "...(truncated, showing most recent)...\n\n" .. text:sub(1, 30000)
     end
-    local ok, err = pcall(function()
-        local shareIntent = Intent(Intent.ACTION_SEND)
-        shareIntent.setType("text/plain")
-        shareIntent.putExtra(Intent.EXTRA_SUBJECT, "CSR AI Assistant — History Export")
-        shareIntent.putExtra(Intent.EXTRA_TEXT, text)
-        local chooser = Intent.createChooser(shareIntent, "Share History")
-        chooser.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-        ctx.startActivity(chooser)
-    end)
-    if not ok then
-        logError("shareHistory failed: " .. tostring(err))
-        vibratePattern("error")
-        notify("Share نہیں ہو سکا: " .. tostring(err))
-    end
+    shareTextAndCloseApp(text, "CSR AI Assistant — History Export", "Share History", { histDlg })
 end
 
 function showHistoryDialog()
@@ -316,38 +311,38 @@ function showHistoryDialog()
 
     local histDlg = LuaDialog(ctx)
     histDlg.setTitle("Saved History (" .. #history .. ")")
+    pcall(applyAccessibilityLabels, listLayout)
     histDlg.setView(listLayout)
     histDlg.setPositiveButton("Close", nil)
-    histDlg.setNegativeButton("Clear All", function()
+    histDlg.setNegativeButton("Clear All", guard("NegativeButton (line 317)", function()
         clearHistory()
         notify("History cleared")
-    end)
-    histDlg.setNeutralButton("Export/Share", function()
-        shareHistory()
-    end)
+    end))
+    histDlg.setNeutralButton("Export/Share", guard("NeutralButton (line 321)", function()
+        shareHistory(histDlg)
+    end))
     histDlg.show()
 
     listView.setOnItemClickListener(AdapterView.OnItemClickListener{
-        onItemClick = function(p, v, pos, id)
+        onItemClick = guard("onItemClick (line 327)", function(p, v, pos, id)
             local item = history[pos + 1]
             histDlg.dismiss()
-            showResultDialog(item.mode .. " — " .. item.time, item.text)
-        end
+            showResultDialog(item.mode .. " — " .. item.time, item.text, { skipAutoRead = true })
+        end)
     })
 end
 
--- Groq (groq.com) کے وژن (تصویر سمجھنے والے) ماڈلز — console.groq.com/docs/vision
--- سے تصدیق شدہ (اکتوبر 2026)۔ Qwen 3.8 27B تازہ ترین ہے اور ڈیفالٹ ہے۔
--- اگر کوئی ماڈل ریٹائر ہو چکا ہو تو ایپ واضح ایرر دکھائے گی، کریش نہیں ہوگی۔
+-- Groq (groq.com) کا وژن (تصویر سمجھنے والا) ماڈل — Qwen 3.8 27B۔
+-- نوٹ: Qwen 3.6 27B کو Groq نے 14 ستمبر 2026 کو بند کر دیا اور اس کی جگہ 3.8 دیا؛
+-- پرانے Llama 4 Scout/Maverick بھی ریٹائر ہو چکے ہیں۔ اب Groq پر یہی ایک وژن
+-- ماڈل ہے۔ نیا ماڈل آنے پر صرف نیچے دو ٹیبلز میں ایک لائن اضافہ کریں۔
 local AI_MODELS = {
-    "Qwen 3.8 27B",
-    "Qwen 3.6 27B"
+    "Qwen 3.8 27B"
 }
 
 -- ماڈل کا ڈسپلے نام -> API ماڈل آئی ڈی
 local aiApiDetails = {
-    ["Qwen 3.8 27B"] = { id = "qwen/qwen3.8-27b" },
-    ["Qwen 3.6 27B"] = { id = "qwen/qwen3.6-27b" }
+    ["Qwen 3.8 27B"] = { id = "qwen/qwen3.8-27b" }
 }
 
 local AI_API_URL = "https://api.groq.com/openai/v1/chat/completions"
@@ -390,6 +385,94 @@ local mainDlg = nil
 local processButton = nil
 local progressDlg = nil
 
+-- بولنے/ٹاک بیک کے لیے متن صاف کرتا ہے: مارک ڈاؤن علامات (* # `) اور بلٹ ہٹاتا ہے
+function cleanForSpeech(text)
+    if not text then return "" end
+    local s = tostring(text)
+    s = s:gsub("[%*#`]", "")
+    s = s:gsub("\226\128\162", "")
+    s = s:gsub("\n%s*%-%s+", "\n")
+    return s
+end
+
+-- بٹن کے متن سے ایموجی/علامات ہٹا کر ٹاک بیک کے لیے صاف نام بناتا ہے
+function cleanLabel(text)
+    local s = tostring(text or "")
+    s = s:gsub("[\240-\244][\128-\191]*", "")
+    s = s:gsub("\226[\154-\157][\128-\191]", "")
+    s = s:gsub("\226\150[\182\183]", "")
+    s = s:gsub("\226\143[\128-\191]", "")
+    s = s:gsub("\239\184[\128-\143]", "")
+    s = s:gsub("\226\128\162", "")
+    s = s:gsub("%s+", " ")
+    s = s:gsub("^%s+", ""):gsub("%s+$", "")
+    return s
+end
+
+-- ویو کے درخت میں ہر بٹن/ٹیکسٹ کو ٹاک بیک کے لیے صاف contentDescription دیتا ہے
+-- (صرف تب جب ایموجی ہٹانے سے متن بدلتا ہو؛ EditText کو کبھی نہیں چھیڑتا تاکہ
+-- API key جیسا لکھا ہوا متن ٹاک بیک پر نہ بولا جائے)
+function applyAccessibilityLabels(view, depth)
+    depth = depth or 0
+    if not view or depth > 14 then return end
+    pcall(function()
+        local simpleName = ""
+        pcall(function() simpleName = tostring(view.getClass().getSimpleName()) end)
+        if simpleName ~= "EditText" then
+            local existing = nil
+            pcall(function() existing = view.getContentDescription() end)
+            if existing == nil or tostring(existing) == "" then
+                local text = nil
+                pcall(function() text = view.getText() end)
+                if text ~= nil and tostring(text) ~= "" then
+                    local original = tostring(text)
+                    local label = cleanLabel(original)
+                    if label ~= "" and label ~= original then
+                        view.setContentDescription(label)
+                    end
+                end
+            end
+        end
+    end)
+    local count = 0
+    pcall(function() count = view.getChildCount() end)
+    for i = 0, count - 1 do
+        local child = nil
+        pcall(function() child = view.getChildAt(i) end)
+        if child then applyAccessibilityLabels(child, depth + 1) end
+    end
+end
+
+-- کسی بھی ہینڈلر (بٹن، ڈائیلاگ بٹن، کال بیک) کو لپیٹتا ہے: اگر اس کے اندر Lua
+-- ایرر آئے تو خاموشی سے ضائع ہونے کے بجائے ایرر ڈائیلاگ میں پوری تفصیل دکھاتا ہے
+function guard(name, fn)
+    return function(...)
+        local ok, result = pcall(fn, ...)
+        if not ok then
+            pcall(reportError, name, tostring(result))
+            return nil
+        end
+        return result
+    end
+end
+
+-- UTF-8 متن کو بائٹس کی حد پر کاٹتا ہے، لیکن کسی حرف کے بیچ میں نہیں
+-- (ورنہ ٹوٹا ہوا UTF-8 JSON/API میں ایرر دیتا ہے — اردو میں ہر حرف 2 بائٹ کا ہوتا ہے)
+function safeUtf8Cut(s, maxBytes)
+    s = tostring(s or "")
+    if #s <= maxBytes then return s end
+    local cut = maxBytes
+    while cut > 0 do
+        local b = string.byte(s, cut + 1)
+        if b and b >= 128 and b < 192 then
+            cut = cut - 1
+        else
+            break
+        end
+    end
+    return s:sub(1, cut)
+end
+
 function notify(msg)
   if service and service.speak then service.speak(msg) end
   Toast.makeText(ctx, msg, Toast.LENGTH_SHORT).show()
@@ -423,7 +506,7 @@ function vibratePattern(kind)
         pcall(function() vibrator.vibrate(step[1]) end)
         if step[2] and step[2] > 0 then
             local handler = Handler(Looper.getMainLooper())
-            handler.postDelayed(Runnable({ run = function() runStep(i + 1) end }), step[1] + step[2])
+            handler.postDelayed(Runnable({ run = guard("run (line 509)", function() runStep(i + 1) end) }), step[1] + step[2])
         end
     end
     runStep(1)
@@ -433,7 +516,12 @@ function getAIApiKey() return aiPrefs.getString("groq_apiKey", "") end
 function saveAIApiKey(key) aiEditor.putString("groq_apiKey", key); aiEditor.commit() end
 function getSelectedLanguage() return aiPrefs.getString("selected_language", "English") end
 function saveSelectedLanguage(lang) aiEditor.putString("selected_language", lang); aiEditor.commit() end
-function getAIModel() return aiPrefs.getString("groq_model", "Qwen 3.8 27B") end
+function getAIModel()
+    local m = aiPrefs.getString("groq_model", "Qwen 3.8 27B")
+    -- پرانا محفوظ شدہ ماڈل (مثلاً بند ہو چکا Qwen 3.6) ہو تو ڈیفالٹ پر واپس
+    if not aiApiDetails[m] then return "Qwen 3.8 27B" end
+    return m
+end
 function saveAIModel(model) aiEditor.putString("groq_model", model); aiEditor.commit() end
 function getSelectedRecognizeOption()
     local opt = aiPrefs.getString("rec_option", "Analyze Image")
@@ -461,6 +549,14 @@ function getTTSEnginePackage() return aiPrefs.getString("tts_engine_pkg", "") en
 function saveTTSEnginePackage(pkg) aiEditor.putString("tts_engine_pkg", pkg or ""); aiEditor.commit() end
 function getTTSVoiceName() return aiPrefs.getString("tts_voice_name", "") end
 function saveTTSVoiceName(name) aiEditor.putString("tts_voice_name", name or ""); aiEditor.commit() end
+
+-- نئے ٹوگلز: نتائج خودکار پڑھنا، لائیو موڈ میں صرف تبدیلی پر بولنا، ہسٹری محفوظ کرنا
+function isAutoReadResults() return aiPrefs.getBoolean("auto_read_results", false) end
+function setAutoReadResults(v) aiEditor.putBoolean("auto_read_results", v and true or false); aiEditor.commit() end
+function isSpeakOnlyOnChange() return aiPrefs.getBoolean("live_only_changes", true) end
+function setSpeakOnlyOnChange(v) aiEditor.putBoolean("live_only_changes", v and true or false); aiEditor.commit() end
+function isSaveHistoryEnabled() return aiPrefs.getBoolean("save_history", true) end
+function setSaveHistoryEnabled(v) aiEditor.putBoolean("save_history", v and true or false); aiEditor.commit() end
 
 -- =====================================================================
 -- TOKEN USAGE TRACKING — ہر کامیاب Groq API کال کے بعد اصل ٹوکن
@@ -510,6 +606,17 @@ function recordTokenUsage(usage)
             monthTotal = 0
         end
         monthTotal = monthTotal + totalTokens
+
+        -- ماہانہ بجٹ کی وارننگ: 80% اور 100% پر (ہر حد صرف ایک بار عبور ہونے پر)
+        local prevMonthTotal = monthTotal - totalTokens
+        local budgetLimit = getTokenBudgetMonthly()
+        if budgetLimit and budgetLimit > 0 then
+            if prevMonthTotal < budgetLimit and monthTotal >= budgetLimit then
+                pcall(function() notify("Warning: your monthly token budget has been reached.") end)
+            elseif prevMonthTotal < budgetLimit * 0.8 and monthTotal >= budgetLimit * 0.8 then
+                pcall(function() notify("Warning: you have used 80 percent of your monthly token budget.") end)
+            end
+        end
 
         -- ہمیشہ کے لیے کل کاؤنٹر (کبھی ری سیٹ نہیں ہوتا)
         local allTimeTotal = aiPrefs.getInt("tokens_alltime_total", 0) + totalTokens
@@ -596,15 +703,16 @@ function showTokenUsageDialog()
 
     local dlg = LuaDialog(ctx)
     dlg.setTitle("Token Usage")
+    pcall(applyAccessibilityLabels, layout)
     dlg.setView(layout)
-    dlg.setPositiveButton("Save Budget", function()
+    dlg.setPositiveButton("Save Budget", guard("PositiveButton (line 708)", function()
         local ok, num = pcall(function() return tonumber(budgetInput.getText().toString()) end)
         if ok and num then
             saveTokenBudgetMonthly(math.floor(num))
             notify("بجٹ محفوظ ہو گیا")
         end
         dlg.dismiss()
-    end)
+    end))
     dlg.setNegativeButton("Close", nil)
     dlg.show()
 end
@@ -1055,15 +1163,46 @@ local function extractAIText(decoded)
     return nil
 end
 
+-- Groq کے 429 پیغام ("Please try again in 7m12.3s") سے انتظار کا وقت (سیکنڈ) نکالتا ہے
+local function parseRetryAfterSeconds(msg)
+    if not msg then return nil end
+    local s = string.lower(tostring(msg))
+    local tail = s:match("try again in%s+([%w%.%s]+)")
+    if not tail then return nil end
+    local t = tail:sub(1, 24)
+    local total, found = 0, false
+    local ms = t:match("([%d%.]+)ms")
+    if ms then
+        t = t:gsub("[%d%.]+ms", "")
+        total = total + (tonumber(ms) or 0) / 1000
+        found = true
+    end
+    local h = t:match("(%d+)h")
+    if h then total = total + tonumber(h) * 3600; found = true end
+    local m = t:match("(%d+)m")
+    if m then total = total + tonumber(m) * 60; found = true end
+    local sec = t:match("([%d%.]+)s")
+    if sec then total = total + (tonumber(sec) or 0); found = true end
+    if found then return math.ceil(total) end
+    return nil
+end
+
+local function formatDuration(sec)
+    sec = tonumber(sec) or 0
+    if sec < 90 then return math.max(1, math.floor(sec)) .. " seconds" end
+    if sec < 5400 then return math.ceil(sec / 60) .. " minutes" end
+    return string.format("%.1f", sec / 3600) .. " hours"
+end
+
 -- ایک ہی کوشش (attempt) کے لیے Groq کو HTTP کال
--- onDone(text, errorMessage, retryable, httpStatus)
+-- onDone(text, errorMessage, retryable, httpStatus, retryAfterSeconds)
 local function attemptAICall(apiKey, payload, attemptNumber, model, onDone)
     local headers = {
         ["Content-Type"] = "application/json",
         ["Authorization"] = "Bearer " .. tostring(apiKey)
     }
     local ok, err = pcall(function()
-        Http.post(AI_API_URL, cjson.encode(payload), headers, function(status, data)
+        Http.post(AI_API_URL, cjson.encode(payload), headers, guard("http callback (line 1205)", function(status, data)
             status = tonumber(status) or 0
             if status == 200 then
                 local decodeOk, decoded = pcall(cjson.decode, data)
@@ -1096,7 +1235,18 @@ local function attemptAICall(apiKey, payload, attemptNumber, model, onDone)
                 onDone(nil, "Error 413: تصویر/درخواست بہت بڑی ہے۔", false, 413)
             elseif status == 408 or status == 429 then
                 local msg = extractAIErrorMessage(data)
-                onDone(nil, "Error " .. status .. ": Rate limit (مفت پلان کی حد) یا وقت ختم۔ تھوڑی دیر بعد دوبارہ کوشش کریں۔ " .. tostring(msg or ""), true, status)
+                local wait = parseRetryAfterSeconds(msg)
+                local lower = string.lower(tostring(msg or ""))
+                local daily = string.find(lower, "per day", 1, true) or string.find(lower, "(tpd)", 1, true) or string.find(lower, "(rpd)", 1, true)
+                local friendly
+                if status == 408 then
+                    friendly = "The request timed out. Trying again."
+                elseif daily then
+                    friendly = "Groq's free DAILY limit has been reached" .. (wait and (". It resets in about " .. formatDuration(wait)) or "") .. ". To keep using the AI, wait for the reset or upgrade to the Groq Developer plan."
+                else
+                    friendly = "Groq's free per-minute limit was reached" .. (wait and (". Waiting about " .. formatDuration(wait) .. " before trying again") or "") .. "."
+                end
+                onDone(nil, friendly, true, status, wait)
             elseif status >= 500 then
                 onDone(nil, "Server Error " .. status .. ": Groq سروس عارضی طور پر دستیاب نہیں۔", true, status)
             elseif status == 0 or status < 0 then
@@ -1105,7 +1255,7 @@ local function attemptAICall(apiKey, payload, attemptNumber, model, onDone)
                 local msg = extractAIErrorMessage(data)
                 onDone(nil, "API Error " .. status .. ": " .. tostring(msg or ""), false, status)
             end
-        end)
+        end))
     end)
     if not ok then
         logError("attemptAICall pcall failed: " .. tostring(err))
@@ -1159,6 +1309,7 @@ function getCachedResponse(key)
 end
 
 function setCachedResponse(key, text)
+    if not isSaveHistoryEnabled() then return end   -- پرائیویسی ٹوگل بند ہو تو کیش بھی محفوظ نہیں ہوتا
     pcall(function()
         local cache = loadResponseCache()
         cache[key] = { text = text, time = os.time() }
@@ -1184,6 +1335,16 @@ end
 function callAIWithImage(apiKey, model, base64Data, prompt, callback, opts)
     opts = opts or {}
     local maxTokens = opts.maxTokens or 1500
+    local requestedModel = model
+
+    -- اگر حال ہی میں اس ماڈل سے دوسرے ماڈل پر منتقلی ہوئی تھی (5 منٹ تک) تو وہی استعمال کریں
+    local override = runtimeState.modelOverride
+    if override and override.from == model and os.time() < override.expires and aiApiDetails[override.model] then
+        model = override.model
+    end
+    local triedModels = {}
+    triedModels[model] = true
+    local switchedModel = false
 
     if runtimeState.safeModeActive then
         -- Safe Mode خود بخود 60 سیکنڈ بعد ختم ہو جاتا ہے (پہلے یہ ہمیشہ کے لیے بلاک کر دیتا تھا)
@@ -1222,11 +1383,14 @@ function callAIWithImage(apiKey, model, base64Data, prompt, callback, opts)
     if base64Data then
         table.insert(contentParts, { type = "image_url", image_url = { url = "data:image/jpeg;base64," .. base64Data } })
     end
+    -- صرف متن والی درخواست میں content سادہ سٹرنگ ہو (سرور یہی فارمیٹ سب سے محفوظ مانتا ہے)
+    local contentField = contentParts
+    if not base64Data then contentField = prompt end
     local payload = {
         model = modelInfo.id,
         messages = {{
             role = "user",
-            content = contentParts
+            content = contentField
         }},
         max_completion_tokens = maxTokens,
         stream = false
@@ -1239,10 +1403,13 @@ function callAIWithImage(apiKey, model, base64Data, prompt, callback, opts)
     logInfo("Calling Groq model=" .. modelInfo.id)
 
     local function tryAttempt(attemptNumber)
-        attemptAICall(apiKey, payload, attemptNumber, model, function(result, errMsg, retryable, httpStatus)
+        attemptAICall(apiKey, payload, attemptNumber, model, function(result, errMsg, retryable, httpStatus, retryAfter)
             if result then
                 logInfo("Groq call succeeded on attempt " .. attemptNumber)
                 resetFailureState()
+                if switchedModel then
+                    runtimeState.modelOverride = { from = requestedModel, model = model, expires = os.time() + 300 }
+                end
                 if cacheKey then setCachedResponse(cacheKey, result) end
                 callback(result, nil)
                 return
@@ -1259,16 +1426,47 @@ function callAIWithImage(apiKey, model, base64Data, prompt, callback, opts)
                 return
             end
 
-            if retryable and attemptNumber <= CONFIG.MAX_RETRIES then
+            -- 429 پر Groq کے بتائے ہوئے وقت تک انتظار؛ اگر انتظار 20 سیکنڈ سے لمبا ہو
+            -- (مثلاً روزانہ حد) تو بار بار کوشش کرنے کے بجائے فوراً واضح پیغام واپس کریں
+            local longWait = (httpStatus == 429 and retryAfter and retryAfter > 20)
+            if retryable and not longWait and attemptNumber <= CONFIG.MAX_RETRIES then
+                local delayMs = CONFIG.RETRY_DELAY_MS
+                if httpStatus == 429 and retryAfter then
+                    delayMs = math.max(delayMs, math.floor(retryAfter * 1000) + 300)
+                end
                 local handler = Handler(Looper.getMainLooper())
-                handler.postDelayed(Runnable({ run = function()
+                handler.postDelayed(Runnable({ run = guard("run (line 1438)", function()
                     tryAttempt(attemptNumber + 1)
-                end }), CONFIG.RETRY_DELAY_MS)
+                end) }), delayMs)
             else
+                -- ماڈل دستیاب نہیں (404) یا rate limit (429) ہو تو دوسرے Qwen ماڈل پر خودکار منتقلی
+                if httpStatus == 404 or httpStatus == 429 then
+                    local altName = nil
+                    for _, name in ipairs(AI_MODELS) do
+                        if not triedModels[name] and aiApiDetails[name] then
+                            altName = name
+                            break
+                        end
+                    end
+                    if altName then
+                        triedModels[altName] = true
+                        logWarn("Switching model from " .. tostring(model) .. " to " .. altName .. " (status " .. tostring(httpStatus) .. ")")
+                        model = altName
+                        switchedModel = true
+                        payload.model = aiApiDetails[altName].id
+                        pcall(function() notify("Switching to " .. altName .. " because the first model is unavailable or busy.") end)
+                        tryAttempt(1)
+                        return
+                    end
+                end
                 -- صرف سرور/نیٹ ورک کی خرابیاں Safe Mode کی طرف گنی جاتی ہیں؛
                 -- غلط key/ماڈل جیسی ترتیب کی غلطیاں نہیں
-                if retryable then enterSafeModeIfNeeded() end
-                callback(nil, errMsg)
+                -- rate limit (429) کو Safe Mode کی طرف نہیں گنا جاتا
+                if retryable and httpStatus ~= 429 then enterSafeModeIfNeeded() end
+                if not opts.silentErrors then
+                    pcall(reportError, "AI request (" .. tostring(model) .. ")", tostring(errMsg), "HTTP status: " .. tostring(httpStatus))
+                end
+                callback(nil, errMsg, httpStatus, retryAfter)
             end
         end)
     end
@@ -1401,11 +1599,12 @@ function scanAllImages()
         
         local listDlg = LuaDialog(ctx)
         listDlg.setTitle("Select Image (Last 100)")
+        pcall(applyAccessibilityLabels, listLayout)
         listDlg.setView(listLayout)
         listDlg.show()
         
         listView.setOnItemClickListener(AdapterView.OnItemClickListener{
-            onItemClick = function(p, v, pos, id)
+            onItemClick = guard("onItemClick (line 1607)", function(p, v, pos, id)
                 selectedPhotoPath = photoFilePaths[pos + 1]
                 selectedPhotoUri = nil
                 if _G.statusLabel then
@@ -1413,7 +1612,7 @@ function scanAllImages()
                 end
                 notify("Selected: " .. File_CLASS(selectedPhotoPath).getName())
                 listDlg.dismiss()
-            end
+            end)
         })
     else
         notify("No images found.")
@@ -1473,8 +1672,9 @@ function scanAllImagesForBatch(callback)
 
     local listDlg = LuaDialog(ctx)
     listDlg.setTitle("منتخب کریں (متعدد تصاویر، آخری 100)")
+    pcall(applyAccessibilityLabels, listLayout)
     listDlg.setView(listLayout)
-    listDlg.setPositiveButton("Process Selected", function()
+    listDlg.setPositiveButton("Process Selected", guard("PositiveButton (line 1677)", function()
         local selectedPaths = {}
         local ok, err = pcall(function()
             local checkedPositions = listView.getCheckedItemPositions()
@@ -1495,7 +1695,7 @@ function scanAllImagesForBatch(callback)
             return
         end
         callback(selectedPaths)
-    end)
+    end))
     listDlg.setNegativeButton("Cancel", nil)
     listDlg.show()
 end
@@ -1721,7 +1921,7 @@ function ensureRateTTSReady(callback)
 
     local ok, err = pcall(function()
         local initListener = TextToSpeech.OnInitListener{
-            onInit = function(status)
+            onInit = guard("onInit (line 1924)", function(status)
                 if status == TextToSpeech.SUCCESS then
                     applyVoiceAndReturn()
                 else
@@ -1729,7 +1929,7 @@ function ensureRateTTSReady(callback)
                     rateTtsReady = false
                     callback(false)
                 end
-            end
+            end)
         }
         if enginePkg and enginePkg ~= "" then
             rateTtsEngine = TextToSpeech(ctx, initListener, enginePkg)
@@ -1748,8 +1948,10 @@ end
 -- اگر صارف نے TTS Settings میں انجن/آواز/رفتار/پچ میں سے کچھ بھی
 -- ڈیفالٹ سے تبدیل کیا ہو تو کنفیگرڈ TTS انجن سے بولا جاتا ہے، ورنہ
 -- عام service.speak() ہی استعمال ہوتا ہے۔
-function speakInSelectedLanguage(text)
+function speakInSelectedLanguage(text, noToast)
     if not text or text == "" then return end
+    text = cleanForSpeech(text)
+    if text == "" then return end
 
     local rate = getSpeechRate()
     local pitch = getSpeechPitch()
@@ -1789,9 +1991,11 @@ function speakInSelectedLanguage(text)
     end
 
     -- طویل جواب اسکرین پر بھی دکھا دیں (تاکہ سکرین ریڈر یا خود صارف اسے پڑھ/دیکھ سکے)
-    pcall(function()
-        Toast.makeText(ctx, text, Toast.LENGTH_LONG).show()
-    end)
+    if not noToast then
+        pcall(function()
+            Toast.makeText(ctx, text, Toast.LENGTH_LONG).show()
+        end)
+    end
 end
 
 function stopTTS()
@@ -1910,7 +2114,7 @@ function showTTSSettingsDialog()
 
         local ok, err = pcall(function()
             local initListener = TextToSpeech.OnInitListener{
-                onInit = function(status)
+                onInit = guard("onInit (line 2117)", function(status)
                     if status ~= TextToSpeech.SUCCESS then
                         logWarn("Preview TTS init failed for voice listing, status=" .. tostring(status))
                         voiceSpinner.setAdapter(ArrayAdapter(ctx, android.R.layout.simple_spinner_item, {"(کوئی آواز نہیں ملی)"}))
@@ -1945,7 +2149,7 @@ function showTTSSettingsDialog()
                         logError("Voice enumeration failed: " .. tostring(err2))
                         voiceSpinner.setAdapter(ArrayAdapter(ctx, android.R.layout.simple_spinner_item, {"(آوازیں لوڈ نہیں ہو سکیں)"}))
                     end
-                end
+                end)
             }
             if enginePkg ~= "" then
                 previewEngine = TextToSpeech(ctx, initListener, enginePkg)
@@ -1963,7 +2167,7 @@ function showTTSSettingsDialog()
     local ok, err = pcall(function()
         local bootstrapEngine = nil
         bootstrapEngine = TextToSpeech(ctx, TextToSpeech.OnInitListener{
-            onInit = function(status)
+            onInit = guard("onInit (line 2170)", function(status)
                 local labels = {"Default (System)"}
                 engineList = {{label = "Default (System)", pkg = ""}}
                 if status == TextToSpeech.SUCCESS then
@@ -1985,7 +2189,7 @@ function showTTSSettingsDialog()
                 end
                 loadVoicesForCurrentSelection()
                 pcall(function() bootstrapEngine.shutdown() end)
-            end
+            end)
         })
     end)
     if not ok then
@@ -1994,17 +2198,17 @@ function showTTSSettingsDialog()
     end
 
     engineSpinner.setOnItemSelectedListener(AdapterView.OnItemSelectedListener{
-        onItemSelected = function(p, v, pos, id) loadVoicesForCurrentSelection() end
+        onItemSelected = guard("onItemSelected (line 2201)", function(p, v, pos, id) loadVoicesForCurrentSelection() end)
     })
     langSpinner.setOnItemSelectedListener(AdapterView.OnItemSelectedListener{
-        onItemSelected = function(p, v, pos, id) loadVoicesForCurrentSelection() end
+        onItemSelected = guard("onItemSelected (line 2204)", function(p, v, pos, id) loadVoicesForCurrentSelection() end)
     })
 
     -- Test Voice بٹن
     local btnTest = Button(ctx)
     btnTest.setText("▶️ Test Voice")
     btnTest.setPadding(0, 15, 0, 0)
-    btnTest.onClick = function()
+    btnTest.onClick = guard("onClick (line 2211)", function()
         if not previewEngine or not previewReady then
             notify("انجن ابھی تیار نہیں، تھوڑا انتظار کریں")
             return
@@ -2021,13 +2225,14 @@ function showTTSSettingsDialog()
             logError("Test Voice failed: " .. tostring(err3))
             notify("ٹیسٹ نہیں ہو سکا: " .. tostring(err3))
         end
-    end
+    end)
     layout.addView(btnTest)
 
     local dlg = LuaDialog(ctx)
     dlg.setTitle("TTS Settings")
+    pcall(applyAccessibilityLabels, scrollView)
     dlg.setView(scrollView)
-    dlg.setPositiveButton("Save", function()
+    dlg.setPositiveButton("Save", guard("PositiveButton (line 2235)", function()
         local enginePos = engineSpinner.getSelectedItemPosition()
         local chosenEngine = engineList[enginePos + 1]
         saveTTSEnginePackage(chosenEngine and chosenEngine.pkg or "")
@@ -2046,10 +2251,10 @@ function showTTSSettingsDialog()
         destroyPreviewEngine()
         notify("TTS Settings محفوظ ہو گئیں")
         dlg.dismiss()
-    end)
-    dlg.setNegativeButton("Cancel", function()
+    end))
+    dlg.setNegativeButton("Cancel", guard("NegativeButton (line 2255)", function()
         destroyPreviewEngine()
-    end)
+    end))
     dlg.show()
 end
 
@@ -2058,6 +2263,9 @@ end
 -- بغیر مینیو ڈھونڈے۔ ڈیفالٹ آف ہے (Settings سے آن کریں) تاکہ بلاوجہ
 -- بیٹری استعمال یا غلطی سے ٹرگر نہ ہو۔
 -- =====================================================================
+-- آگے declare کیا گیا تاکہ شیک والا کوڈ اسی ٹیبل کو دیکھے (پہلے یہ nil global پڑھتا تھا)
+local liveModeState
+
 local shakeState = {
     sensorManager = nil,
     listener = nil,
@@ -2086,13 +2294,13 @@ function onShakeDetected()
     logInfo("Shake detected — opening Live Mode.")
     vibratePattern("notify")
     local handler = Handler(Looper.getMainLooper())
-    handler.post(Runnable({ run = function()
+    handler.post(Runnable({ run = guard("run (line 2297)", function()
         pcall(function()
             if not liveModeState.active then
                 startLiveMode()
             end
         end)
-    end }))
+    end) }))
 end
 
 function registerShakeListener()
@@ -2105,7 +2313,7 @@ function registerShakeListener()
             return
         end
         shakeState.listener = SensorEventListener{
-            onSensorChanged = function(event)
+            onSensorChanged = guard("onSensorChanged (line 2316)", function(event)
                 local ok2, err2 = pcall(function()
                     local arr = event.values
                     local x = getArrVal(arr, 0)
@@ -2120,7 +2328,7 @@ function registerShakeListener()
                     end
                 end)
                 if not ok2 then logError("Shake sensor processing error: " .. tostring(err2)) end
-            end,
+            end),
             onAccuracyChanged = function(sensor, accuracy) end
         }
         shakeState.sensorManager.registerListener(shakeState.listener, shakeState.accelSensor, SensorManager.SENSOR_DELAY_NORMAL)
@@ -2140,7 +2348,7 @@ function unregisterShakeListener()
     shakeState.registered = false
 end
 
-local liveModeState = {
+liveModeState = {
     active = false,
     camera = nil,
     busy = false,
@@ -2148,7 +2356,11 @@ local liveModeState = {
     pausedUntil = 0,         -- اس وقت تک خودکار تفصیل رکی رہے گی (جب صارف سوال پوچھ رہا ہو)
     lastSpokeAt = 0,
     lastError = nil,
-    cameraRotation = nil
+    cameraRotation = nil,
+    lastSpokenText = nil,    -- آخری بولی گئی تفصیل (دہراؤ روکنے کے لیے)
+    unchangedStreak = 0,     -- لگاتار کتنی بار منظر نہیں بدلا
+    quickBusy = false,       -- Read/Detail/Label بٹن کا کام جاری ہے
+    rateLimitedUntil = 0     -- Groq کی حد (429) کی وجہ سے اس وقت تک لائیو لوپ رکا رہے گا
 }
 
 -- Voice Q&A کے دوران خودکار تفصیل روک دیتا ہے تاکہ مائیک خود فون کی آواز نہ
@@ -2171,6 +2383,10 @@ function stopLiveMode()
     liveModeState.busy = false
     liveModeState.pausedUntil = 0
     liveModeState.lastError = nil
+    liveModeState.lastSpokenText = nil
+    liveModeState.unchangedStreak = 0
+    liveModeState.quickBusy = false
+    liveModeState.rateLimitedUntil = 0
     logInfo("Live Mode stopped.")
 end
 
@@ -2234,13 +2450,13 @@ function captureFreshFrame(callback)
     local done = false
     local ok = pcall(function()
         liveModeState.camera.setOneShotPreviewCallback(Camera.PreviewCallback{
-            onPreviewFrame = function(data, cam)
+            onPreviewFrame = guard("onPreviewFrame (line 2453)", function(data, cam)
                 if done then return end
                 done = true
                 local b64 = nv21ToJpegBase64(data, cam)
                 if b64 then liveModeState.lastFrameBase64 = b64 end
                 callback(b64)
-            end
+            end)
         })
     end)
     if not ok then
@@ -2248,12 +2464,36 @@ function captureFreshFrame(callback)
         return
     end
     local handler = Handler(Looper.getMainLooper())
-    handler.postDelayed(Runnable({ run = function()
+    handler.postDelayed(Runnable({ run = guard("run (line 2467)", function()
         if not done then
             done = true
             callback(nil)
         end
-    end }), 2500)
+    end) }), 2500)
+end
+
+-- دو جملوں کی مشابہت (0 سے 1): مشترک الفاظ / کل الگ الفاظ
+local function wordSetOf(s)
+    local set, n = {}, 0
+    for w in tostring(s):lower():gmatch("%S+") do
+        w = w:gsub("%p", "")
+        if w ~= "" and not set[w] then
+            set[w] = true
+            n = n + 1
+        end
+    end
+    return set, n
+end
+
+local function textSimilarity(a, b)
+    local sa, na = wordSetOf(a)
+    local sb, nb = wordSetOf(b)
+    if na == 0 or nb == 0 then return 0 end
+    local common = 0
+    for w in pairs(sa) do
+        if sb[w] then common = common + 1 end
+    end
+    return common / (na + nb - common)
 end
 
 -- ایک فریم کی تفصیل بولتا ہے۔ onFinished: کام ختم ہونے پر (تاکہ اگلا کیپچر شیڈول ہو)
@@ -2279,29 +2519,49 @@ function processLiveFrame(base64Data, statusTv, onFinished)
         basePrompt = "Reply in exactly ONE short, natural, spoken-style sentence (max 12 words). Describe anything important directly ahead for a visually impaired person walking: people, obstacles, stairs, vehicles, doors, or hazards. If something notable is present, include a rough approximate distance (e.g. 'a few steps ahead', 'right in front of you', 'about 2 meters away') based on visual perspective — this is only an estimate, not exact. If the path is clear, say so."
     end
     local prompt = basePrompt .. " IMPORTANT: your entire reply must be written ONLY in " .. lang .. ". Do not use English or any other language, not even a single word (unless " .. lang .. " itself is English). Do not add labels, quotes, or any extra text — output only the spoken sentence."
-    callAIWithImage(apiKey, getAIModel(), base64Data, prompt, function(res, err)
+    callAIWithImage(apiKey, getAIModel(), base64Data, prompt, function(res, err, httpStatus, retryAfter)
         -- اگر اسی دوران صارف نے سوال پوچھنا شروع کر دیا ہو تو یہ خودکار جواب بولیں نہیں
         local paused = os.time() < liveModeState.pausedUntil
         if res then
             liveModeState.lastError = nil
             if not paused then
-                if statusTv then pcall(function() statusTv.setText(res) end) end
-                liveModeState.lastSpokeAt = os.time()
-                speakInSelectedLanguage(res)
-                saveHistoryEntry("Live Mode (" .. lang .. ")", res)
+                -- اگر منظر پچھلی تفصیل جیسا ہی ہے تو دوبارہ نہ بولیں (40 سیکنڈ بعد تسلی کے لیے پھر بولتا ہے)
+                local similar = false
+                if isSpeakOnlyOnChange() and liveModeState.lastSpokenText
+                        and (os.time() - (liveModeState.lastSpokeAt or 0)) < 40 then
+                    similar = textSimilarity(res, liveModeState.lastSpokenText) >= 0.7
+                end
+                if similar then
+                    liveModeState.unchangedStreak = (liveModeState.unchangedStreak or 0) + 1
+                    if statusTv then pcall(function() statusTv.setText(res .. "\n\n(no change)") end) end
+                else
+                    liveModeState.unchangedStreak = 0
+                    liveModeState.lastSpokenText = res
+                    if statusTv then pcall(function() statusTv.setText(res) end) end
+                    liveModeState.lastSpokeAt = os.time()
+                    speakInSelectedLanguage(res)
+                    saveHistoryEntry("Live Mode (" .. lang .. ")", res)
+                end
             end
         else
             logError("Live frame error: " .. tostring(err))
+            -- Rate limit لگنے پر لائیو لوپ Groq کے بتائے وقت (زیادہ سے زیادہ 5 منٹ) تک رک جاتا ہے،
+            -- بار بار درخواستیں بھیج کر حد کو اور خراب نہیں کرتا
+            if httpStatus == 429 then
+                local pauseSec = math.min(tonumber(retryAfter) or 30, 300) + 1
+                liveModeState.rateLimitedUntil = os.time() + pauseSec
+            end
             if statusTv then pcall(function() statusTv.setText("⚠️ " .. tostring(err)) end) end
-            -- ہر مختلف ایرر صرف ایک بار بولیں (بار بار بولنے سے تنگ نہ ہو)
-            if err ~= liveModeState.lastError and not paused then
-                liveModeState.lastError = err
+            -- ہر مختلف قسم کا ایرر صرف ایک بار بولیں (وقت بدلنے سے پیغام مختلف نہ سمجھا جائے)
+            local errKey = tostring(httpStatus or err)
+            if errKey ~= liveModeState.lastError and not paused then
+                liveModeState.lastError = errKey
                 vibratePattern("error")
                 speakInSelectedLanguage(tostring(err))
             end
         end
         finish()
-    end, { maxTokens = 150, noCache = true })
+    end, { maxTokens = 120, noCache = true, silentErrors = true })
 end
 
 -- =====================================================================
@@ -2399,7 +2659,7 @@ end
 -- ہو (ایرر 12/13)، تو خودکار طور پر ڈیوائس کی ڈیفالٹ زبان کے ساتھ ایک
 -- بار دوبارہ کوشش کرتا ہے — تاکہ صارف کو صرف "کام نہیں کر رہا" کے
 -- بجائے کوئی نتیجہ ملے۔
-function askQuestionInLiveMode(statusTv, useDeviceDefaultLocale, attemptNumber)
+function askQuestionInLiveMode(statusTv, useDeviceDefaultLocale, attemptNumber, onQuestion)
     attemptNumber = attemptNumber or 1
 
     if not hasRecordAudioPermission() then
@@ -2430,7 +2690,7 @@ function askQuestionInLiveMode(statusTv, useDeviceDefaultLocale, attemptNumber)
     -- جاتا ہے۔ چونکہ ہمیں یقین نہیں کہ بٹن کلک کس تھریڈ پر آتا ہے، اسے
     -- جبراً Main Looper پر بھیجا جا رہا ہے۔
     local handler = Handler(Looper.getMainLooper())
-    handler.postDelayed(Runnable({ run = function()
+    handler.postDelayed(Runnable({ run = guard("run (line 2693)", function()
         local ok, err = pcall(function()
             if not SpeechRecognizer.isRecognitionAvailable(ctx) then
                 error("Speech recognition not available on this device")
@@ -2467,13 +2727,17 @@ function askQuestionInLiveMode(statusTv, useDeviceDefaultLocale, attemptNumber)
             onEndOfSpeech = function()
                 if statusTv then pcall(function() statusTv.setText("سوچ رہا ہوں...") end) end
             end,
-            onResults = function(results)
+            onResults = guard("onResults (line 2730)", function(results)
                 local ok2, err2 = pcall(function()
                     local matches = results.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
                     if matches and matches.size() > 0 then
                         local question = matches.get(0)
                         logInfo("Voice question recognized: " .. tostring(question))
-                        askAIFollowUp(question, statusTv)
+                        if onQuestion then
+                            onQuestion(question)
+                        else
+                            askAIFollowUp(question, statusTv)
+                        end
                     else
                         vibratePattern("error")
                         pauseLiveAuto(0)
@@ -2482,8 +2746,8 @@ function askQuestionInLiveMode(statusTv, useDeviceDefaultLocale, attemptNumber)
                 end)
                 if not ok2 then logError("onResults handling failed: " .. tostring(err2)) end
                 pcall(function() recognizer.destroy() end)
-            end,
-            onError = function(errorCode)
+            end),
+            onError = guard("onError (line 2750)", function(errorCode)
                 logWarn("SpeechRecognizer error code: " .. tostring(errorCode))
                 pcall(function() recognizer.destroy() end)
 
@@ -2492,20 +2756,23 @@ function askQuestionInLiveMode(statusTv, useDeviceDefaultLocale, attemptNumber)
                 if (errorCode == 12 or errorCode == 13) and attemptNumber == 1 and not useDeviceDefaultLocale then
                     logInfo("Retrying speech recognition with device default locale.")
                     if statusTv then pcall(function() statusTv.setText("اس زبان میں آواز شناخت دستیاب نہیں — ڈیوائس کی ڈیفالٹ زبان سے دوبارہ کوشش ہو رہی ہے...") end) end
-                    askQuestionInLiveMode(statusTv, true, 2)
+                    askQuestionInLiveMode(statusTv, true, 2, onQuestion)
                 elseif (errorCode == 6 or errorCode == 7) and attemptNumber == 1 then
                     -- کچھ سنائی نہیں دیا: ایک بار خودکار طور پر دوبارہ سننے کی کوشش
                     if statusTv then pcall(function() statusTv.setText("آواز سنائی نہیں دی — دوبارہ بولیں...") end) end
                     vibratePattern("notify")
-                    askQuestionInLiveMode(statusTv, useDeviceDefaultLocale, 2)
+                    askQuestionInLiveMode(statusTv, useDeviceDefaultLocale, 2, onQuestion)
                 else
                     pauseLiveAuto(0)
                     vibratePattern("error")
                     -- خرابی کا صاف مطلب + اصل کوڈ، دونوں دکھائیں (بگ رپورٹ کرنا آسان ہو)
+                    if errorCode ~= 6 and errorCode ~= 7 then
+                        pcall(reportError, "Voice input (microphone)", describeSpeechError(errorCode), "SpeechRecognizer error code " .. tostring(errorCode))
+                    end
                     notify(describeSpeechError(errorCode) .. " [code:" .. tostring(errorCode) .. "]")
                     if statusTv then pcall(function() statusTv.setText(describeSpeechError(errorCode) .. " (error code " .. tostring(errorCode) .. ")") end) end
                 end
-            end,
+            end),
             onPartialResults = function(partialResults)
                 local ok3, question = pcall(function()
                     local matches = partialResults.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
@@ -2529,7 +2796,68 @@ function askQuestionInLiveMode(statusTv, useDeviceDefaultLocale, attemptNumber)
             notify("Voice سوال شروع نہیں ہو سکا — تفصیل: " .. tostring(err))
             if statusTv then pcall(function() statusTv.setText("Voice error: " .. tostring(err)) end) end
         end
-    end }), listenDelayMs)
+    end) }), listenDelayMs)
+end
+
+-- لائیو موڈ کے فوری بٹن: Read Text / Detail / Label
+function liveQuickAction(kind, statusTv)
+    if not liveModeState.active then
+        notify("Start Live Mode first.")
+        return
+    end
+    if liveModeState.quickBusy then
+        notify("Please wait, the last request is still running.")
+        return
+    end
+    local apiKey = getAIApiKey()
+    if not apiKey or apiKey == "" then
+        notify("API Key missing! Set it in Settings.")
+        return
+    end
+    local lang = getSelectedLanguage()
+    local titles = { read = "Read Text", detail = "Detailed Description", label = "Label Reader" }
+    local prompt
+    if kind == "read" then
+        prompt = "Read ALL the text visible in this image exactly as written, in natural reading order, so it can be spoken aloud. Do not add commentary. If there is no readable text, say so briefly. Write any short introductory words in " .. lang .. ", but keep the text itself exactly as printed."
+    elseif kind == "detail" then
+        prompt = "Describe this scene in detail for a visually impaired person, in about 6 to 10 short, clear sentences: the surroundings, people and what they are doing, important objects, any visible text, colours, hazards and rough distances. IMPORTANT: reply ONLY in " .. lang .. ", with no words from any other language (unless " .. lang .. " itself is English)."
+    else
+        prompt = buildPromptForMode("Label & Medicine Reader", lang)
+    end
+
+    liveModeState.quickBusy = true
+    pauseLiveAuto(60)
+    pcall(stopTTS)
+    vibratePattern("processing")
+    if statusTv then pcall(function() statusTv.setText(titles[kind] .. "...") end) end
+
+    captureFreshFrame(function(frame)
+        local image = frame or liveModeState.lastFrameBase64
+        if not image then
+            liveModeState.quickBusy = false
+            pauseLiveAuto(0)
+            vibratePattern("error")
+            notify("No camera picture is available yet. Please try again in a moment.")
+            return
+        end
+        callAIWithImage(apiKey, getAIModel(), image, prompt, function(res, err)
+            liveModeState.quickBusy = false
+            if res then
+                if statusTv then pcall(function() statusTv.setText(titles[kind] .. ":\n\n" .. res) end) end
+                speakInSelectedLanguage(res, true)
+                liveModeState.lastSpokeAt = os.time()
+                local est = math.max(8, math.ceil(#res / 18))
+                if getSpeechRate() < 1 then est = math.ceil(est * 1.4) end
+                pauseLiveAuto(est + 2)
+                saveHistoryEntry("Live " .. titles[kind] .. " (" .. lang .. ")", res)
+            else
+                pauseLiveAuto(0)
+                vibratePattern("error")
+                if statusTv then pcall(function() statusTv.setText("⚠️ " .. tostring(err)) end) end
+                notify("Could not complete the request: " .. tostring(err))
+            end
+        end, { maxTokens = 1100, noCache = true })
+    end)
 end
 
 function startLiveMode()
@@ -2543,7 +2871,7 @@ function startLiveMode()
     liveLayout.setOrientation(1)
 
     local surfaceView = SurfaceView(ctx)
-    surfaceView.setLayoutParams(LinearLayout.LayoutParams(-1, dp(280)))
+    surfaceView.setLayoutParams(LinearLayout.LayoutParams(-1, dp(200)))
     liveLayout.addView(surfaceView)
 
     local statusTv = TextView(ctx)
@@ -2557,27 +2885,47 @@ function startLiveMode()
     btnAsk.setText("🎤 ASK A QUESTION")
     btnAsk.setBackgroundColor(0xFF4CAF50)
     btnAsk.setTextColor(0xFFFFFFFF)
-    btnAsk.onClick = function() askQuestionInLiveMode(statusTv) end
+    btnAsk.onClick = guard("onClick (line 2888)", function() askQuestionInLiveMode(statusTv) end)
     liveLayout.addView(btnAsk)
+
+    -- فوری بٹن: متن پڑھیں / تفصیل / لیبل
+    local quickRow = LinearLayout(ctx)
+    quickRow.setOrientation(0)
+    local function addQuick(label, description, kind)
+        local b = Button(ctx)
+        b.setText(label)
+        b.setContentDescription(description)
+        b.setLayoutParams(LinearLayout.LayoutParams(0, -2, 1))
+        b.onClick = guard("onClick (line 2899)", function() liveQuickAction(kind, statusTv) end)
+        quickRow.addView(b)
+    end
+    addQuick("📖 Read", "Read the text in front of the camera aloud", "read")
+    addQuick("🔍 Detail", "Describe the scene in detail", "detail")
+    addQuick("💊 Label", "Read a medicine or product label", "label")
+    liveLayout.addView(quickRow)
 
     local liveDlg = LuaDialog(ctx)
     liveDlg.setTitle("Live Navigation Mode — " .. getSelectedLanguage() .. " (every " .. (getLiveModeIntervalSeconds()) .. "s)")
-    liveDlg.setView(liveLayout)
+    local liveScroll = ScrollView(ctx)
+    liveScroll.setFillViewport(true)
+    liveScroll.addView(liveLayout)
+    pcall(applyAccessibilityLabels, liveScroll)
+    liveDlg.setView(liveScroll)
     liveDlg.setCancelable(false)
-    liveDlg.setNegativeButton("Stop", function()
+    liveDlg.setNegativeButton("Stop", guard("NegativeButton (line 2915)", function()
         stopLiveMode()
         notify("Live Mode بند کر دیا گیا")
         createMainUI()
-    end)
+    end))
     liveDlg.show()
 
     local holder = surfaceView.getHolder()
     holder.addCallback(SurfaceHolder.Callback{
-        surfaceCreated = function(h)
+        surfaceCreated = guard("surfaceCreated (line 2924)", function(h)
             local ok, err = pcall(function()
                 liveModeState.camera = Camera.open()
 
-                -- فریم چھوٹے (≤800x600) رکھیں تاکہ اپلوڈ اور جواب تیز ہو، اور
+                -- فریم چھوٹے (≤640x480) رکھیں (کم ٹوکن خرچ ہوتے ہیں) تاکہ اپلوڈ اور جواب تیز ہو، اور
                 -- مسلسل فوکس لگائیں تاکہ تصویر دھندلی نہ آئے
                 pcall(function()
                     local cam = liveModeState.camera
@@ -2587,7 +2935,7 @@ function startLiveMode()
                     for i = 0, sizes.size() - 1 do
                         local sz = sizes.get(i)
                         local w, h = sz.width, sz.height
-                        if w <= 800 and h <= 600 and (w * h) > bestArea then
+                        if w <= 640 and h <= 480 and (w * h) > bestArea then
                             bestW, bestH, bestArea = w, h, w * h
                         end
                     end
@@ -2607,6 +2955,7 @@ function startLiveMode()
                 liveModeState.active = true
                 liveModeState.busy = false
                 liveModeState.pausedUntil = 0
+                liveModeState.rateLimitedUntil = 0
                 statusTv.setText("Live Mode active — جلد پہلی تفصیل آ رہی ہے...")
                 logInfo("Live Mode camera started.")
 
@@ -2615,9 +2964,9 @@ function startLiveMode()
                 local loopHandler = Handler(Looper.getMainLooper())
                 local function scheduleNextCapture(delayMs)
                     if not liveModeState.active then return end
-                    loopHandler.postDelayed(Runnable({ run = function()
+                    loopHandler.postDelayed(Runnable({ run = guard("run (line 2967)", function()
                         if not liveModeState.active or not liveModeState.camera then return end
-                        if liveModeState.busy or os.time() < liveModeState.pausedUntil then
+                        if liveModeState.busy or os.time() < liveModeState.pausedUntil or os.time() < (liveModeState.rateLimitedUntil or 0) then
                             scheduleNextCapture(1000)
                             return
                         end
@@ -2625,65 +2974,186 @@ function startLiveMode()
                         captureFreshFrame(function(b64)
                             if b64 and liveModeState.active then
                                 processLiveFrame(b64, statusTv, function()
-                                    scheduleNextCapture(getLiveModeIntervalSeconds() * 1000)
+                                    -- منظر نہ بدلے تو چیک کا وقفہ بڑھتا ہے (زیادہ سے زیادہ 3 گنا): کم درخواستیں، کم 429
+                                    local streak = math.min(liveModeState.unchangedStreak or 0, 2)
+                                    scheduleNextCapture(getLiveModeIntervalSeconds() * 1000 * (1 + streak))
                                 end)
                             else
                                 liveModeState.busy = false
                                 scheduleNextCapture(1500)
                             end
                         end)
-                    end }), delayMs)
+                    end) }), delayMs)
                 end
                 scheduleNextCapture(1200)
             end)
             if not ok then
                 logError("Live Mode camera failed to start: " .. tostring(err))
+                pcall(reportError, "Live Mode camera", tostring(err))
                 statusTv.setText("Camera دستیاب نہیں۔ App Settings میں جا کر Camera permission دیں اور دوبارہ کوشش کریں۔")
                 notify("Camera access failed. براہ کرم App Settings میں Camera permission چیک کریں۔")
             end
-        end,
+        end),
         surfaceChanged = function(h, format, w, hgt) end,
         surfaceDestroyed = function(h) stopLiveMode() end
     })
 end
 
-function showResultDialog(title, content)
+-- Share پر کلک کرتے ہی ایپ کی تمام کھلی ونڈوز (مین اسکرین، سیٹنگز، لائیو موڈ وغیرہ)
+-- بند کر کے شیئر شیٹ کھولتا ہے، تاکہ ایپ "بند" ہو جائے اور شیئر شیٹ کے پیچھے
+-- پرانی ونڈوز نہ رہیں۔ dialogsToClose: وہ ڈائیلاگ جو اس وقت کھلے ہیں
+function shareTextAndCloseApp(text, subject, chooserTitle, dialogsToClose)
+    if dialogsToClose then
+        for _, d in ipairs(dialogsToClose) do
+            pcall(function() d.dismiss() end)
+        end
+    end
+    pcall(stopLiveMode)
+    if mainDlg then
+        pcall(function() mainDlg.dismiss() end)
+        mainDlg = nil
+    end
+
+    local ok, err = pcall(function()
+        local shareIntent = Intent(Intent.ACTION_SEND)
+        shareIntent.setType("text/plain")
+        if subject then shareIntent.putExtra(Intent.EXTRA_SUBJECT, subject) end
+        shareIntent.putExtra(Intent.EXTRA_TEXT, text)
+        local chooser = Intent.createChooser(shareIntent, chooserTitle or "Share")
+        chooser.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        ctx.startActivity(chooser)
+    end)
+    if not ok then
+        logError("Share failed: " .. tostring(err))
+        vibratePattern("error")
+        notify("Could not open the share sheet: " .. tostring(err))
+        pcall(reportError, "Share", tostring(err))
+    end
+    return ok
+end
+
+-- opts.skipAutoRead: خودکار پڑھنا نہ کریں (مثلاً ہسٹری سے دوبارہ کھولتے وقت)
+-- opts.followUp = { image = base64, mode = "..." }: "Ask a Follow-up" بٹن دکھائیں
+function showResultDialog(title, content, opts)
+    opts = opts or {}
     local resultDlg = LuaDialog(ctx)
     resultDlg.setTitle(title)
     local scrollView = ScrollView(ctx)
     scrollView.setFillViewport(true)
+    local inner = LinearLayout(ctx)
+    inner.setOrientation(1)
+    inner.setPadding(30, 20, 30, 20)
+
+    local btnRead = Button(ctx)
+    btnRead.setText("🔊 Read Aloud")
+    btnRead.onClick = guard("onClick (line 3049)", function() speakInSelectedLanguage(content, true) end)
+    inner.addView(btnRead)
+
+    if opts.followUp and opts.followUp.image then
+        local btnFollow = Button(ctx)
+        btnFollow.setText("💬 Ask a Follow-up Question")
+        btnFollow.onClick = guard("onClick (line 3055)", function()
+            showFollowUpDialog(opts.followUp.image, content, opts.followUp.mode)
+        end)
+        inner.addView(btnFollow)
+    end
+
+    -- وائس میسج کے متن کے لیے: ترجمہ / خلاصہ
+    if opts.textActions then
+        local btnTranslate = Button(ctx)
+        btnTranslate.setText("🌐 Translate to My Language")
+        btnTranslate.onClick = guard("onClick (line 3065)", function() runTextAction("translate", content) end)
+        inner.addView(btnTranslate)
+
+        local btnSummarize = Button(ctx)
+        btnSummarize.setText("📝 Summarize")
+        btnSummarize.onClick = guard("onClick (line 3070)", function() runTextAction("summarize", content) end)
+        inner.addView(btnSummarize)
+    end
+
     local textView = TextView(ctx)
     textView.setText(content)
     textView.setTextSize(14)
-    textView.setPadding(30, 20, 30, 20)
+    textView.setPadding(0, 20, 0, 20)
     textView.setTextColor(0xFF000000)
-    scrollView.addView(textView)
+    inner.addView(textView)
+    scrollView.addView(inner)
+    pcall(applyAccessibilityLabels, scrollView)
     resultDlg.setView(scrollView)
     resultDlg.setPositiveButton("Close", nil)
-    resultDlg.setNeutralButton("Copy", function()
+    resultDlg.setNeutralButton("Copy", guard("NeutralButton (line 3084)", function()
         local clipboard = ctx.getSystemService(Context.CLIPBOARD_SERVICE)
         clipboard.setText(content)
         notify("Copied to clipboard")
         vibrate()
-    end)
-    resultDlg.setNegativeButton("Share", function()
-        local ok, err = pcall(function()
-            local shareIntent = Intent(Intent.ACTION_SEND)
-            shareIntent.setType("text/plain")
-            shareIntent.putExtra(Intent.EXTRA_TEXT, content)
-            local chooser = Intent.createChooser(shareIntent, "Share via")
-            chooser.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-            ctx.startActivity(chooser)
-        end)
-        if ok then
+    end))
+    resultDlg.setNegativeButton("Share", guard("NegativeButton (line 3090)", function()
+        if shareTextAndCloseApp(content, nil, "Share via", { resultDlg }) then
             vibratePattern("success")
-        else
-            logError("Share (result dialog) failed: " .. tostring(err))
-            vibratePattern("error")
-            notify("Share نہیں ہو سکا: " .. tostring(err))
         end
-    end)
+    end))
     resultDlg.show()
+    if isAutoReadResults() and not opts.skipAutoRead then
+        speakInSelectedLanguage(content, true)
+    end
+end
+
+-- تجزیے کے بعد اسی تصویر کے بارے میں مزید سوال پوچھنا (بول کر یا لکھ کر)
+function showFollowUpDialog(imageB64, previousAnswer, mode)
+    local layout = LinearLayout(ctx)
+    layout.setOrientation(1)
+    layout.setPadding(30, 20, 30, 20)
+
+    local hint = TextView(ctx)
+    hint.setText("Type your question about this image, or tap Speak and say it aloud.")
+    hint.setTextSize(13)
+    layout.addView(hint)
+
+    local input = EditText(ctx)
+    input.setHint("Your question")
+    layout.addView(input)
+
+    local function runFollowUp(question)
+        question = tostring(question or ""):gsub("^%s+", ""):gsub("%s+$", "")
+        if question == "" then
+            notify("Please type or say a question first.")
+            return
+        end
+        local apiKey = getAIApiKey()
+        if not apiKey or apiKey == "" then
+            notify("API Key missing! Set it in Settings.")
+            return
+        end
+        showProgress("Thinking about your question...")
+        local lang = getSelectedLanguage()
+        local prevShort = tostring(previousAnswer or "")
+        if #prevShort > 1500 then prevShort = prevShort:sub(1, 1500) end
+        local prompt = "The user is visually impaired. You previously analysed the attached image (mode: " .. tostring(mode) .. ") and your earlier answer was:\n\"" .. prevShort .. "\"\nThe user now asks a follow-up question: \"" .. question .. "\"\nAnswer using what is visible in the image, clearly and specifically. IMPORTANT: reply ONLY in " .. lang .. ", with no words from any other language (unless " .. lang .. " itself is English)."
+        callAIWithImage(apiKey, getAIModel(), imageB64, prompt, function(res, err)
+            hideProgress()
+            if res then
+                saveHistoryEntry("Follow-up (" .. tostring(mode) .. ")", question .. " → " .. res)
+                vibratePattern("success")
+                showResultDialog("Follow-up Answer", "Q: " .. question .. "\n\nA: " .. res, { followUp = { image = imageB64, mode = mode } })
+            else
+                vibratePattern("error")
+                notify("Error: " .. tostring(err))
+            end
+        end, { maxTokens = 900, noCache = true })
+    end
+
+    local dlg = LuaDialog(ctx)
+    dlg.setTitle("Follow-up Question")
+    pcall(applyAccessibilityLabels, layout)
+    dlg.setView(layout)
+    dlg.setPositiveButton("Ask", guard("PositiveButton (line 3149)", function()
+        runFollowUp(input.getText().toString())
+    end))
+    dlg.setNeutralButton("🎤 Speak", guard("NeutralButton (line 3152)", function()
+        askQuestionInLiveMode(nil, nil, 1, function(q) runFollowUp(q) end)
+    end))
+    dlg.setNegativeButton("Cancel", nil)
+    dlg.show()
 end
 
 function showAISettingsDialog()
@@ -2712,7 +3182,7 @@ function showAISettingsDialog()
     local testBtn = Button(ctx)
     testBtn.setText("Test API Key")
     testBtn.setLayoutParams(LinearLayout.LayoutParams(0, -2, 1))
-    testBtn.onClick = function()
+    testBtn.onClick = guard("onClick (line 3185)", function()
         local key = apiInput.getText().toString()
         if key == "" then
             notify("Please enter API Key to test")
@@ -2730,7 +3200,7 @@ function showAISettingsDialog()
             Http.post(AI_API_URL, cjson.encode(testPayload), {
                 ["Content-Type"] = "application/json",
                 ["Authorization"] = "Bearer " .. key
-            }, function(status, data)
+            }, guard("http callback (line 3203)", function(status, data)
                 status = tonumber(status) or 0
                 if status == 200 then
                     notify("Success: Groq API Key درست ہے! ✅")
@@ -2745,10 +3215,10 @@ function showAISettingsDialog()
                 else
                     notify("Error (Status " .. status .. "): " .. tostring(extractAIErrorMessage(data) or ""))
                 end
-            end)
+            end))
         end)
         if not ok then notify("Test نہیں ہو سکا: " .. tostring(err)) end
-    end
+    end)
     btnLayout.addView(testBtn)
     
     local settingsDlg = LuaDialog(ctx)
@@ -2756,7 +3226,7 @@ function showAISettingsDialog()
     local createBtn = Button(ctx)
     createBtn.setText("Create API Key")
     createBtn.setLayoutParams(LinearLayout.LayoutParams(0, -2, 1))
-    createBtn.onClick = function()
+    createBtn.onClick = guard("onClick (line 3229)", function()
         local ok, err = pcall(function()
             local url = AI_CREATE_KEY_URL
             local intent = Intent(Intent.ACTION_VIEW, Uri.parse(url))
@@ -2774,7 +3244,7 @@ function showAISettingsDialog()
             mainDlg.dismiss() 
             mainDlg = nil 
         end
-    end
+    end)
     btnLayout.addView(createBtn)
     
     settingsLayout.addView(btnLayout)
@@ -2795,6 +3265,7 @@ function showAISettingsDialog()
         end
     end
     settingsLayout.addView(modelSpinner)
+    pcall(function() modelSpinner.setContentDescription("AI model") end)
 
     -- Live Mode کا وقفہ (سیکنڈز)
     local intervalLabel = TextView(ctx)
@@ -2812,6 +3283,7 @@ function showAISettingsDialog()
         if INTERVAL_OPTIONS[i] == savedInterval then intervalSpinner.setSelection(i - 1) break end
     end
     settingsLayout.addView(intervalSpinner)
+    pcall(function() intervalSpinner.setContentDescription("Live Mode interval") end)
 
     -- بولنے کی رفتار
     local rateLabel = TextView(ctx)
@@ -2829,6 +3301,7 @@ function showAISettingsDialog()
         if RATE_OPTIONS[i] == savedRate then rateSpinner.setSelection(i - 1) break end
     end
     settingsLayout.addView(rateSpinner)
+    pcall(function() rateSpinner.setContentDescription("Speech rate") end)
 
     -- بولنے کی پچ
     local pitchLabel = TextView(ctx)
@@ -2846,6 +3319,7 @@ function showAISettingsDialog()
         if PITCH_OPTIONS[i] == savedPitch then pitchSpinner.setSelection(i - 1) break end
     end
     settingsLayout.addView(pitchSpinner)
+    pcall(function() pitchSpinner.setContentDescription("Speech pitch") end)
 
     -- Custom Prompts / Backup-Restore بٹن
     local advancedBtnLayout = LinearLayout(ctx)
@@ -2855,13 +3329,13 @@ function showAISettingsDialog()
     local btnCustomPrompts = Button(ctx)
     btnCustomPrompts.setText("Custom Prompts")
     btnCustomPrompts.setLayoutParams(LinearLayout.LayoutParams(0, -2, 1))
-    btnCustomPrompts.onClick = function() showCustomPromptsDialog() end
+    btnCustomPrompts.onClick = guard("onClick (line 3332)", function() showCustomPromptsDialog() end)
     advancedBtnLayout.addView(btnCustomPrompts)
 
     local btnBackupRestore = Button(ctx)
     btnBackupRestore.setText("Backup / Restore")
     btnBackupRestore.setLayoutParams(LinearLayout.LayoutParams(0, -2, 1))
-    btnBackupRestore.onClick = function() showBackupRestoreDialog(settingsDlg) end
+    btnBackupRestore.onClick = guard("onClick (line 3338)", function() showBackupRestoreDialog(settingsDlg) end)
     advancedBtnLayout.addView(btnBackupRestore)
 
     settingsLayout.addView(advancedBtnLayout)
@@ -2870,14 +3344,14 @@ function showAISettingsDialog()
     local btnTTSSettings = Button(ctx)
     btnTTSSettings.setText("🔊 TTS Settings (Engine / Voice)")
     btnTTSSettings.setPadding(0, 10, 0, 0)
-    btnTTSSettings.onClick = function() showTTSSettingsDialog() end
+    btnTTSSettings.onClick = guard("onClick (line 3347)", function() showTTSSettingsDialog() end)
     settingsLayout.addView(btnTTSSettings)
 
     -- Token Usage بٹن
     local btnTokenUsage = Button(ctx)
     btnTokenUsage.setText("📊 Token Usage")
     btnTokenUsage.setPadding(0, 10, 0, 0)
-    btnTokenUsage.onClick = function() showTokenUsageDialog() end
+    btnTokenUsage.onClick = guard("onClick (line 3354)", function() showTokenUsageDialog() end)
     settingsLayout.addView(btnTokenUsage)
 
     -- Shake-to-Activate ٹوگل بٹن
@@ -2887,7 +3361,7 @@ function showAISettingsDialog()
     end
     updateShakeButtonText()
     btnShakeToggle.setPadding(0, 10, 0, 0)
-    btnShakeToggle.onClick = function()
+    btnShakeToggle.onClick = guard("onClick (line 3364)", function()
         if isShakeEnabled() then
             setShakeEnabled(false)
             unregisterShakeListener()
@@ -2898,8 +3372,27 @@ function showAISettingsDialog()
             notify("Shake-to-Activate آن کر دیا گیا — فون ہلانے پر Live Mode کھلے گا")
         end
         updateShakeButtonText()
-    end
+    end)
     settingsLayout.addView(btnShakeToggle)
+
+    -- عام ٹوگل بٹن بنانے والا ہیلپر
+    local function addToggleButton(getFn, setFn, labelOn, labelOff)
+        local btn = Button(ctx)
+        local function refresh()
+            btn.setText(getFn() and labelOn or labelOff)
+        end
+        refresh()
+        btn.setPadding(0, 10, 0, 0)
+        btn.onClick = guard("onClick (line 3386)", function()
+            setFn(not getFn())
+            refresh()
+            notify(cleanLabel(tostring(btn.getText())))   -- Button کا getText() لوا اسٹرنگ دیتا ہے، اس پر .toString() نہیں چلتا
+        end)
+        settingsLayout.addView(btn)
+    end
+    addToggleButton(isAutoReadResults, setAutoReadResults, "🔊 Auto-Read Results: ON", "🔊 Auto-Read Results: OFF")
+    addToggleButton(isSpeakOnlyOnChange, setSpeakOnlyOnChange, "🗣 Live Mode: Speak Only When Scene Changes: ON", "🗣 Live Mode: Speak Only When Scene Changes: OFF")
+    addToggleButton(isSaveHistoryEnabled, setSaveHistoryEnabled, "🗂 Save History and Cache: ON", "🗂 Save History and Cache: OFF")
     
     local infoText = TextView(ctx)
     infoText.setText("Get API key from: console.groq.com/keys")
@@ -2909,8 +3402,9 @@ function showAISettingsDialog()
     settingsLayout.addView(infoText)
     
     settingsDlg.setTitle("AI Engine Settings")
+    pcall(applyAccessibilityLabels, scrollSettings)
     settingsDlg.setView(scrollSettings)
-    settingsDlg.setPositiveButton("Save", function()
+    settingsDlg.setPositiveButton("Save", guard("PositiveButton (line 3407)", function()
         local newKey = apiInput.getText().toString()
         if newKey ~= "" then
             saveAIApiKey(newKey)
@@ -2925,7 +3419,7 @@ function showAISettingsDialog()
         saveSpeechPitch(PITCH_OPTIONS[pitchSpinner.getSelectedItemPosition() + 1])
         notify("Settings saved")
         settingsDlg.dismiss()
-    end)
+    end))
     settingsDlg.setNegativeButton("Cancel", nil)
     settingsDlg.show()
 end
@@ -2981,22 +3475,23 @@ function showCustomPromptsDialog()
 
     local dlg = LuaDialog(ctx)
     dlg.setTitle("Custom Prompts")
+    pcall(applyAccessibilityLabels, scrollView)
     dlg.setView(scrollView)
-    dlg.setPositiveButton("Save", function()
+    dlg.setPositiveButton("Save", guard("PositiveButton (line 3480)", function()
         for _, modeKey in ipairs(modeOrder) do
             saveCustomPrompt(modeKey, inputs[modeKey].getText().toString())
         end
         notify("Custom prompts محفوظ ہو گئے")
         dlg.dismiss()
-    end)
+    end))
     dlg.setNegativeButton("Cancel", nil)
-    dlg.setNeutralButton("Reset All", function()
+    dlg.setNeutralButton("Reset All", guard("NeutralButton (line 3488)", function()
         for _, modeKey in ipairs(modeOrder) do
             saveCustomPrompt(modeKey, "")
         end
         notify("سب کسٹم پرامپٹس ری سیٹ ہو گئے")
         dlg.dismiss()
-    end)
+    end))
     dlg.show()
 end
 
@@ -3186,7 +3681,7 @@ function showBackupRestoreDialog(parentSettingsDlg)
 
     local btnBackupFile = Button(ctx)
     btnBackupFile.setText("📦 Backup to File")
-    btnBackupFile.onClick = function()
+    btnBackupFile.onClick = guard("onClick (line 3684)", function()
         local uri, err = exportSettingsToZipFile()
         if uri then
             vibratePattern("success")
@@ -3194,13 +3689,14 @@ function showBackupRestoreDialog(parentSettingsDlg)
         else
             vibratePattern("error")
             notify(err or "بیک اپ ناکام ہوا")
+            pcall(reportError, "Backup to File", tostring(err or "Backup failed"))
         end
-    end
+    end)
     layout.addView(btnBackupFile)
 
     local btnRestoreFile = Button(ctx)
     btnRestoreFile.setText("📂 Restore from File")
-    btnRestoreFile.onClick = function()
+    btnRestoreFile.onClick = guard("onClick (line 3699)", function()
         local ok, err = importSettingsFromZipFile()
         if ok then
             vibratePattern("success")
@@ -3208,8 +3704,9 @@ function showBackupRestoreDialog(parentSettingsDlg)
         else
             vibratePattern("error")
             notify(err or "Restore ناکام ہوا")
+            pcall(reportError, "Restore from File", tostring(err or "Restore failed"))
         end
-    end
+    end)
     layout.addView(btnRestoreFile)
 
     local sep = TextView(ctx)
@@ -3228,8 +3725,9 @@ function showBackupRestoreDialog(parentSettingsDlg)
 
     local dlg = LuaDialog(ctx)
     dlg.setTitle("Backup / Restore Settings")
+    pcall(applyAccessibilityLabels, scrollView)
     dlg.setView(scrollView)
-    dlg.setPositiveButton("Copy Text", function()
+    dlg.setPositiveButton("Copy Text", guard("PositiveButton (line 3730)", function()
         local ok, err = pcall(function()
             local clipboard = ctx.getSystemService(Context.CLIPBOARD_SERVICE)
             clipboard.setText(backupInput.getText().toString())
@@ -3240,8 +3738,8 @@ function showBackupRestoreDialog(parentSettingsDlg)
             logError("Backup copy failed: " .. tostring(err))
             notify("کاپی نہیں ہو سکا")
         end
-    end)
-    dlg.setNegativeButton("Import Text (Paste Above)", function()
+    end))
+    dlg.setNegativeButton("Import Text (Paste Above)", guard("NegativeButton (line 3742)", function()
         local ok, err = importSettingsFromJSON(backupInput.getText().toString())
         if ok then
             notify("ترتیبات کامیابی سے import ہو گئیں")
@@ -3249,28 +3747,10 @@ function showBackupRestoreDialog(parentSettingsDlg)
             vibratePattern("error")
             notify(err or "Import ناکام ہوا")
         end
-    end)
-    dlg.setNeutralButton("Share Text", function()
-        -- بگ فکس: Share پر کلک کرنے سے پہلے تمام کھلے ڈائیلاگ بند کریں،
-        -- ورنہ شیئر شیٹ کے پیچھے ایپ کے پرانے ڈائیلاگ الجھن پیدا کرتے تھے
-        dlg.dismiss()
-        if parentSettingsDlg then pcall(function() parentSettingsDlg.dismiss() end) end
-        if mainDlg then pcall(function() mainDlg.dismiss() end) mainDlg = nil end
-
-        local ok, err = pcall(function()
-            local shareIntent = Intent(Intent.ACTION_SEND)
-            shareIntent.setType("text/plain")
-            shareIntent.putExtra(Intent.EXTRA_SUBJECT, "CSR AI Assistant Settings Backup")
-            shareIntent.putExtra(Intent.EXTRA_TEXT, backupInput.getText().toString())
-            local chooser = Intent.createChooser(shareIntent, "Share Backup")
-            chooser.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-            ctx.startActivity(chooser)
-        end)
-        if not ok then
-            logError("Backup share failed: " .. tostring(err))
-            notify("Share نہیں ہو سکا: " .. tostring(err))
-        end
-    end)
+    end))
+    dlg.setNeutralButton("Share Text", guard("NeutralButton (line 3751)", function()
+        shareTextAndCloseApp(backupInput.getText().toString(), "CSR AI Assistant Settings Backup", "Share Backup", { dlg, parentSettingsDlg })
+    end))
     dlg.show()
 end
 
@@ -3311,10 +3791,11 @@ function showFeedbackForm()
     
     local feedbackDlg = LuaDialog(ctx)
     feedbackDlg.setTitle("Send Feedback to Developer")
+    pcall(applyAccessibilityLabels, formLayout)
     feedbackDlg.setView(formLayout)
     feedbackDlg.setCancelable(true)
     
-    sendButton.onClick = function()
+    sendButton.onClick = guard("onClick (line 3798)", function()
         local name = nameInput.getText().toString()
         local whatsapp = whatsappInput.getText().toString()
         local feedback = feedbackInput.getText().toString()
@@ -3338,9 +3819,226 @@ function showFeedbackForm()
             logError("Feedback WhatsApp intent failed: " .. tostring(err))
             notify("WhatsApp نہیں کھل سکا")
         end
-    end
+    end)
     
     feedbackDlg.show()
+end
+
+-- =====================================================================
+-- ایپ ورژن اور "What's New" فہرست
+-- ہر نئی چیز WHATS_NEW میں اور ہر بگ فکس BUG_FIXES میں ایک نئی لائن (انگریزی
+-- میں) کے طور پر اضافہ کریں — About اسکرین خود بخود انہیں دکھا دے گی۔
+-- =====================================================================
+local APP_VERSION = "2.1"
+
+-- نئے فیچرز اور تبدیلیاں (انگریزی میں)
+local WHATS_NEW = {
+    "AI engine changed to Groq. Image analysis, Batch Processing, Live Navigation Mode and Voice Q&A now all run on Groq's Qwen 3.8 27B vision model. Groq has a free plan with usage limits.",
+    "New API key setup: Settings now has \"Create API Key\" (opens console.groq.com/keys) and \"Test API Key\". Keys from Gemini or xAI will not work; a Groq key starts with gsk_.",
+    "New 7th image mode, Label & Medicine Reader: point the camera at a medicine strip, box or product label and it reads the name, strength and dosage, expiry date, batch number and warnings exactly as printed. It never guesses, tells you when something is unreadable, and reminds you to confirm medicine doses with a doctor or pharmacist.",
+    "Faster Live Mode: smaller camera frames, upright (rotated) pictures for better accuracy, the first description arrives within about 1-2 seconds, and the next picture is taken shortly after each answer. The default gap is now 3 seconds.",
+    "Live Mode quick buttons: Read (reads the text in front of the camera), Detail (a longer description) and Label (reads medicine and product labels).",
+    "Live Mode now speaks only when the scene changes, and checks less often while nothing changes, which also saves your Groq free limit. It repeats itself after about 40 seconds as reassurance. This can be turned off in Settings.",
+    "Live Mode now handles Groq's usage limits properly: it reads the wait time Groq gives, pauses by itself, shows and speaks a clear message (per-minute or daily limit), and carries on automatically afterwards.",
+    "New Diagnostics screen: one tap checks your API key, model, internet, a live test of the Groq service, camera, microphone and storage permissions, voice input, and speech output (including the voice for your selected language), and marks each with a tick, a warning or a cross. You can copy the report.",
+    "New Voice Message to Text: turn a WhatsApp voice message, or any audio file, into text using Groq's Whisper speech recognition. Choose the language spoken in the message, pick it from a list of your newest voice notes, and then read it, listen to it, copy it, share it, translate it or summarize it. Audio files up to 25 MB (Groq's free limit) are accepted, and you are asked to confirm before uploading a large file.",
+    "New error dialog: whenever something goes wrong, a window now opens with exactly where it happened and what the error was, with Copy and Copy All buttons so you can send it. More > Error Log also shows the saved errors and warnings, with Copy and Clear Log.",
+    "New More button on the main screen: Help / Tutorial, Diagnostics, Permissions Status, History and About & Support now live inside it, which makes the main screen shorter and easier to use with a screen reader.",
+    "Every result now has a Read Aloud button, and Settings has an Auto-Read Results option.",
+    "Follow-up questions: after an image analysis you can ask more questions about the same image, by voice or by typing.",
+    "TalkBack support: buttons with emoji now have clean spoken names, the main dropdowns have labels, and speech output no longer reads markdown symbols such as stars and hashes.",
+    "Token budget warnings: you are warned when you reach 80 percent and 100 percent of your monthly budget.",
+    "Privacy toggle: Settings now lets you turn off saving of history and cached answers.",
+    "The Help / Tutorial text is now in English, mentions the Label & Medicine Reader mode and explains the new More menu.",
+    "Support links updated: International Stadium by Bridge Tech, WhatsApp Group, YouTube Channel and WhatsApp Channel.",
+    "Removed the Barcode/QR Scanner, Currency Note Detector and Color Detector modes because they did not work."
+}
+
+-- درست کیے گئے بگز (انگریزی میں)
+local BUG_FIXES = {
+    "Share: tapping Share in a result, in History or in Backup now closes all of the app's windows before the share sheet opens. Before, the app stayed open behind it.",
+    "Live Mode errors 400 and 404: after a short time Live Mode could stop with these errors. The cause was a backup model, Qwen 3.6 27B, which Groq shut down on 14 September 2026. It has been removed, so the app no longer switches to a model that no longer exists.",
+    "Live Mode stopping after a little use: Groq's free plan has per-minute and daily limits. The app now waits and explains instead of failing, and uses smaller pictures and shorter replies to stay within the limits for longer.",
+    "Live Mode errors (wrong key, rate limit, network problems) are now shown on screen and spoken once, instead of failing silently.",
+    "Voice Q&A: Live Mode pauses its own commentary while you speak, so the microphone no longer hears the phone's voice and your answer is no longer cut off. It also takes a fresh camera picture when you ask, still answers general questions when no picture is available, and listens again once if it hears nothing.",
+    "Safe Mode: it now clears itself after about a minute (it used to block the AI until the app was restarted) and no longer triggers for wrong-key or wrong-model mistakes.",
+    "Shake-to-Activate could never open Live Mode because of a coding mistake. It now works when switched on in Settings.",
+    "Clearer error messages for a wrong key, an unavailable model, a request that is too large, rate limits and network problems.",
+    "Summarize and Translate on a voice message could show an error. Text-only requests are now sent in the simpler format the server expects, long transcripts are now cut safely (cutting in the middle of an Urdu letter could break the request), and any error that remains now appears in the new error dialog.",
+    "Voice messages and audio files between 12 MB and 25 MB were refused with a message that the file was not supported. Groq accepts up to 25 MB on the free plan, so those files are now accepted.",
+    "Errors inside buttons and windows used to disappear silently. They are now caught and shown in the error dialog.",
+    "Settings toggle buttons (Auto-Read Results, Speak Only When Scene Changes, Save History and Cache) crashed with a \"toString\" error when tapped. They now switch and announce their new state correctly."
+}
+
+-- =====================================================================
+-- ERROR REPORTING — کوئی بھی ایرر آئے تو ایک ڈائیلاگ میں پوری تفصیل (کہاں اور کیا)
+-- دکھائی جاتی ہے جسے کاپی کر کے بھیجا جا سکتا ہے۔ More > Error Log میں پرانے
+-- ایررز/وارننگز بھی دیکھے جا سکتے ہیں۔
+-- =====================================================================
+local errorHistory = {}
+local errorLastShown = {}
+local errorDialog = nil
+
+local function copyTextToClipboard(text)
+    return pcall(function()
+        local clipboard = ctx.getSystemService(Context.CLIPBOARD_SERVICE)
+        clipboard.setText(text)
+    end)
+end
+
+local function deviceInfoText()
+    local parts = {}
+    pcall(function() table.insert(parts, "Android " .. tostring(Build.VERSION.RELEASE) .. " (API " .. tostring(Build.VERSION.SDK_INT) .. ")") end)
+    pcall(function() table.insert(parts, tostring(Build.MANUFACTURER) .. " " .. tostring(Build.MODEL)) end)
+    return table.concat(parts, ", ")
+end
+
+local function buildErrorReport(source, message, details)
+    local lines = {}
+    table.insert(lines, "CSR AI Vision Assistant error report")
+    table.insert(lines, "Time: " .. os.date("%Y-%m-%d %H:%M:%S"))
+    table.insert(lines, "App version: " .. APP_VERSION)
+    pcall(function()
+        table.insert(lines, "AI model: " .. tostring(getAIModel()) .. " | Language: " .. tostring(getSelectedLanguage()))
+    end)
+    local dev = deviceInfoText()
+    if dev ~= "" then table.insert(lines, "Device: " .. dev) end
+    table.insert(lines, "")
+    table.insert(lines, "WHERE: " .. tostring(source))
+    table.insert(lines, "ERROR: " .. tostring(message))
+    if details and tostring(details) ~= "" then
+        table.insert(lines, "DETAILS: " .. tostring(details))
+    end
+    return table.concat(lines, "\n")
+end
+
+function showErrorDialog(report)
+    if errorDialog then pcall(function() errorDialog.dismiss() end) end
+    local scroll = ScrollView(ctx)
+    scroll.setFillViewport(true)
+    local tv = TextView(ctx)
+    tv.setText(report)
+    tv.setTextSize(13)
+    tv.setPadding(30, 20, 30, 20)
+    pcall(function() tv.setTextIsSelectable(true) end)
+    scroll.addView(tv)
+
+    local dlg = LuaDialog(ctx)
+    errorDialog = dlg
+    dlg.setTitle("⚠️ Error")
+    pcall(applyAccessibilityLabels, scroll)
+    dlg.setView(scroll)
+    dlg.setPositiveButton("Copy", guard("PositiveButton (line 3927)", function()
+        if copyTextToClipboard(report) then notify("Error copied.") else notify("Could not copy.") end
+    end))
+    dlg.setNeutralButton("Copy All", guard("NeutralButton (line 3930)", function()
+        if copyTextToClipboard(table.concat(errorHistory, "\n\n----------\n\n")) then
+            notify("All errors from this session copied.")
+        else
+            notify("Could not copy.")
+        end
+    end))
+    dlg.setNegativeButton("Close", nil)
+    dlg.show()
+end
+
+-- کسی بھی جگہ سے: reportError("کہاں", "کیا ایرر", "اضافی تفصیل")
+function reportError(source, message, details)
+    local msg = tostring(message or "")
+    pcall(function()
+        logError("[" .. tostring(source) .. "] " .. msg .. ((details and details ~= "") and (" | " .. tostring(details)) or ""))
+    end)
+    -- ایک جیسا ایرر 20 سیکنڈ کے اندر بار بار ڈائیلاگ نہ دکھائے
+    local key = tostring(source) .. "|" .. string.sub(msg, 1, 60)
+    local now = os.time()
+    if errorLastShown[key] and now - errorLastShown[key] < 20 then return end
+    errorLastShown[key] = now
+    local ok, report = pcall(buildErrorReport, source, msg, details)
+    if not ok then report = "WHERE: " .. tostring(source) .. "\nERROR: " .. msg end
+    table.insert(errorHistory, report)
+    while #errorHistory > 30 do table.remove(errorHistory, 1) end
+    pcall(vibratePattern, "error")
+    pcall(showErrorDialog, report)
+end
+
+-- لاگ فائل میں سے آخری ایررز اور وارننگز دکھاتا ہے
+function showErrorLogDialog()
+    local lines = {}
+    pcall(function()
+        if logFilePath then
+            local f = io.open(logFilePath, "r")
+            if f then
+                for l in f:lines() do
+                    if string.find(l, "[ERROR]", 1, true) or string.find(l, "[WARN]", 1, true) then
+                        table.insert(lines, l)
+                    end
+                end
+                f:close()
+            end
+        end
+    end)
+    local shown = {}
+    for i = math.max(1, #lines - 79), #lines do table.insert(shown, lines[i]) end
+    local body
+    if #shown > 0 then
+        body = "Last " .. #shown .. " errors and warnings (newest at the bottom):\n\n" .. table.concat(shown, "\n")
+    else
+        body = "No errors or warnings have been logged yet."
+    end
+
+    local scroll = ScrollView(ctx)
+    scroll.setFillViewport(true)
+    local tv = TextView(ctx)
+    tv.setText(body)
+    tv.setTextSize(12)
+    tv.setPadding(30, 20, 30, 20)
+    pcall(function() tv.setTextIsSelectable(true) end)
+    scroll.addView(tv)
+
+    local dlg = LuaDialog(ctx)
+    dlg.setTitle("Error Log")
+    pcall(applyAccessibilityLabels, scroll)
+    dlg.setView(scroll)
+    dlg.setPositiveButton("Copy", guard("PositiveButton (line 3998)", function()
+        if copyTextToClipboard(body) then notify("Error log copied.") else notify("Could not copy.") end
+    end))
+    dlg.setNeutralButton("Clear Log", guard("NeutralButton (line 4001)", function()
+        pcall(function()
+            if logFilePath then
+                local f = io.open(logFilePath, "w")
+                if f then f:close() end
+            end
+        end)
+        notify("Log cleared.")
+    end))
+    dlg.setNegativeButton("Close", nil)
+    dlg.show()
+end
+
+local function buildAboutText()
+    local lines = {}
+    table.insert(lines, "CSR AI Vision Assistant is an Android accessibility tool that uses Groq AI to help visually impaired users understand the world around them. It can describe photos, read text and documents, translate text, read medicine and product labels, and guide you through a live camera view while answering your spoken questions.")
+    table.insert(lines, "")
+    table.insert(lines, "WHAT'S NEW IN VERSION " .. APP_VERSION)
+    for _, item in ipairs(WHATS_NEW) do
+        table.insert(lines, "• " .. item)
+    end
+    table.insert(lines, "")
+    table.insert(lines, "BUG FIXES IN VERSION " .. APP_VERSION)
+    for _, item in ipairs(BUG_FIXES) do
+        table.insert(lines, "• " .. item)
+    end
+    table.insert(lines, "")
+    table.insert(lines, "HOW TO USE \"SUMMARIZE DOCUMENT\"")
+    table.insert(lines, "Choose the \"Summarize Document\" mode, pick a photo of a letter, bill or notice, and tap Process. You will get a short summary, the key details (dates, amounts, names and reference numbers) and suggested next steps.")
+    table.insert(lines, "")
+    table.insert(lines, "GENERAL TIPS")
+    table.insert(lines, "• For the best results, use clear, well-lit photos.")
+    table.insert(lines, "• Current Item mode works with your screen reader's focus.")
+    table.insert(lines, "")
+    table.insert(lines, "PRIVACY")
+    table.insert(lines, "This assistant is free to use. Your history, saved results and settings stay on your device. Photos, voice messages and questions are sent to the Groq service only to generate answers, and this app shares them with no one else.")
+    return table.concat(lines, "\n")
 end
 
 function aboutAndSupport()
@@ -3358,7 +4056,7 @@ function aboutAndSupport()
     mainLayout.setPadding(dp(16), dp(16), dp(16), dp(16))
     
     local titleView = TextView(ctx)
-    titleView.setText("CSR AI Vision Assistant")
+    titleView.setText("CSR AI Vision Assistant  •  Version " .. APP_VERSION)
     titleView.setTextSize(20)
     titleView.setTextColor(0xFF2196F3)
     titleView.setGravity(Gravity.CENTER)
@@ -3393,61 +4091,7 @@ function aboutAndSupport()
     addSpacer(mainLayout, dp(8))
     
     local descText = TextView(ctx)
-    descText.setText(
-        "CSR AI Vision Assistant is a powerful Android accessibility tool that leverages Groq AI to help visually impaired users understand their surroundings.\n\n" ..
-        "--- LATEST CHANGES ---\n" ..
-        "• AI engine switched to Groq (groq.com). Everything now runs on Groq: all image modes, Batch Processing, Live Navigation Mode and Voice Q&A. Available vision models: Qwen 3.8 27B (newest, default) and Qwen 3.6 27B. Groq offers a free tier with rate limits.\n" ..
-        "• Settings now has 'Create API Key' (opens console.groq.com/keys) and 'Test API Key'. IMPORTANT: old Gemini or xAI keys will not work — enter a Groq key (starts with gsk_).\n" ..
-        "• Reasoning is switched off and Live Mode replies are kept short, so answers stay fast.\n" ..
-        "• NEW 7th image mode — Label & Medicine Reader: point at a medicine strip, box or product label and it reads the name, strength/dosage, expiry date, batch number and warnings exactly as printed, and tells you if something is unreadable. It never guesses, and reminds you to confirm medicine doses with a doctor or pharmacist.\n" ..
-        "• Live Mode is faster: smaller camera frames, upright (rotated) images for better accuracy, the first description arrives after about 1-2 seconds instead of a full interval, the next capture starts a short gap after each answer, the default gap is now 3 seconds, and errors (wrong key, rate limit) are now shown and spoken once instead of failing silently.\n" ..
-        "• Voice Q&A fixed: Live Mode now pauses its own commentary while you ask, so the microphone no longer hears the phone's voice and your answer is no longer cut off; it takes a fresh camera picture when you ask, still answers general questions if no picture is available, and retries once if it hears nothing.\n" ..
-        "• Clearer error messages: wrong key, missing credit, unavailable model, rate limit and network problems are now reported separately.\n" ..
-        "• Safe Mode fixed: it used to block the AI until the app was restarted; it now clears itself after about a minute and no longer triggers for wrong-key/model mistakes.\n" ..
-        "• Support links updated: old links removed; International Stadium by Bridge Tech, WhatsApp Group, YouTube Channel and WhatsApp Channel added.\n" ..
-        "• REMOVED: Barcode/QR Scanner, Currency Note Detector and Color Detector modes, because they were not working.\n" ..
-        "• Nothing else was removed — all other features and tips remain.\n\n" ..
-        "--- FEATURES ADDED SO FAR ---\n" ..
-        "• Choose From Gallery: pick any photo for Analyze / Extract Text / Translate / Summarize.\n" ..
-        "• Current Screen & Current Item: describes what's on screen or under screen-reader focus.\n" ..
-        "• Live Navigation Mode: real-time camera preview that automatically describes your surroundings every few seconds, speaking in your selected language.\n" ..
-        "• Voice Q&A in Live Mode: tap 'Ask a Question', speak naturally, and get a spoken answer — works for any kind of question, not just what's visible in the camera.\n" ..
-        "• Answers are generated strictly in whichever of the 50 supported languages you select (Urdu, Hindi, Punjabi, English, Arabic, Tamil, Korean, and many more).\n" ..
-        "• Vibration feedback patterns for success / error / processing, so you know what's happening without looking at the screen.\n" ..
-        "• History: automatically saves your past results so you can revisit or re-listen to them anytime.\n" ..
-        "• Offline OCR fallback for 'Extract Text Only' when no internet is available (requires the Tesseract OCR plugin to be present).\n" ..
-        "• Automatic retries and a Safe Mode fallback if the AI service repeatedly fails, so the app degrades gracefully instead of getting stuck.\n" ..
-        "• Local activity logging for easier troubleshooting.\n" ..
-        "• Batch Processing: select multiple images at once from the gallery and process them all in one go, with a combined results report.\n" ..
-        "• Adjustable Live Mode interval (3/6/10/15 seconds) in Settings.\n" ..
-        "• Speech Rate and Pitch controls in Settings, for both auto-descriptions and Voice Q&A answers.\n" ..
-        "• Live Mode now includes a rough approximate distance estimate for detected obstacles/objects (e.g. 'a few steps ahead') — this is an AI visual estimate, not an exact measurement.\n" ..
-        "• History Export/Share: send your full saved history as text to yourself or someone else.\n" ..
-        "• Settings Backup/Restore: export your API key, model, language, and other settings as text, and restore them on the same or another device.\n" ..
-        "• Custom Prompts: override the built-in AI instructions for any mode (Analyze/Extract/Translate/Summarize/Live/Voice Q&A) with your own wording, from Settings > Custom Prompts.\n" ..
-        "• TTS Settings: choose the speech engine, language, voice, rate and pitch, test it, and save.\n" ..
-        "• Zip Backup/Restore: save all settings to Download/CSR_AI_Assistant as a .zip file and restore from it later (text copy/share also available).\n" ..
-        "• Token Usage: see tokens used today, this month and overall, with an optional monthly budget.\n" ..
-        "• Response Cache: repeating the same image with the same mode and model returns the saved answer instantly without using tokens.\n" ..
-        "• Permissions Status screen and a voice-readable Help / Tutorial (shown automatically on first launch).\n" ..
-        "• Shake-to-Activate (optional, off by default): shake the phone to open Live Mode.\n\n" ..
-        "--- BUGS FIXED ---\n" ..
-        "• Fixed a crash in the old in-app camera-photo capture caused by an unsafe file:// link being passed to the camera app.\n" ..
-        "• Fixed Share/Log-sharing not working, caused by a missing required flag when opening share screens from the background service.\n" ..
-        "• Fixed Live Mode replies sometimes coming out in English even when another language was selected, caused by wording in the AI prompt.\n" ..
-        "• Fixed Live Mode voice output depending on separately-installed voice packs — voice replies now use the device's already-configured accessibility voice, no extra install needed.\n" ..
-        "• Fixed voice question input not responding, caused by voice recognition being started off the required main thread.\n" ..
-        "• Removed the in-app camera-photo and log-share buttons entirely, since they were unreliable — use 'CHOOSE FROM GALLERY' for image analysis instead.\n\n" ..
-        "--- NOT INCLUDED (BY DESIGN) ---\n" ..
-        "• A fully continuous, always-listening voice call with the AI (like a live phone call) is not included — this would need a different real-time streaming AI connection. Instead, Live Mode uses a 'press and ask' voice question system, which works with the AI setup this app uses.\n" ..
-        "---------------------------\n\n" ..
-        "How to use 'Summarize Document':\n" ..
-        "Select the 6th option ('Summarize Document'), pick an image of a complex letter, bill, or notice, and hit Process. The AI will provide a clean Executive Summary, list down crucial information, and suggest next steps.\n\n" ..
-        "General Tips:\n" ..
-        "- For best results, use clear images.\n" ..
-        "- Current Item mode works directly with screen reader focus.\n\n" ..
-        "This assistant is completely free and open for all. No data is stored or shared with any third party besides the Groq API."
-    )
+    descText.setText(buildAboutText())
     descText.setTextSize(13)
     descText.setTextColor(0xFF333333)
     descText.setPadding(0, 0, 0, dp(10))
@@ -3479,7 +4123,7 @@ function aboutAndSupport()
         btnLink.setBackgroundColor(link.color)
         btnLink.setTextColor(0xFFFFFFFF)
         btnLink.setOnClickListener({
-            onClick = function()
+            onClick = guard("onClick (line 4122)", function()
                 dialog.dismiss()
                 if mainDlg then mainDlg.dismiss() end
                 local ok, err = pcall(function()
@@ -3491,7 +4135,7 @@ function aboutAndSupport()
                     logError("Link open failed: " .. tostring(err))
                     notify("Link نہیں کھل سکا")
                 end
-            end
+            end)
         })
         mainLayout.addView(btnLink)
         addSpacer(mainLayout, dp(5))
@@ -3503,10 +4147,10 @@ function aboutAndSupport()
     btnFeedback.setBackgroundColor(0xFFFF9800)
     btnFeedback.setTextColor(0xFFFFFFFF)
     btnFeedback.setOnClickListener({
-        onClick = function()
+        onClick = guard("onClick (line 4146)", function()
             dialog.dismiss()
             showFeedbackForm()
-        end
+        end)
     })
     mainLayout.addView(btnFeedback)
     addSpacer(mainLayout, dp(10))
@@ -3516,13 +4160,14 @@ function aboutAndSupport()
     btnGoBack.setBackgroundColor(0xFF9E9E9E)
     btnGoBack.setTextColor(0xFFFFFFFF)
     btnGoBack.setOnClickListener({
-        onClick = function()
+        onClick = guard("onClick (line 4159)", function()
             dialog.dismiss()
-        end
+        end)
     })
     mainLayout.addView(btnGoBack)
     
     scrollView.addView(mainLayout)
+    pcall(applyAccessibilityLabels, scrollView)
     dialog.setView(scrollView)
     dialog.setCancelable(true)
     dialog.show()
@@ -3557,6 +4202,7 @@ function showProgress(message)
     pb.setIndeterminate(true)
     layout.addView(pb)
     layout.addView(tv)
+    pcall(applyAccessibilityLabels, layout)
     progressDlg.setView(layout)
     progressDlg.setCancelable(false)
     progressDlg.show()
@@ -3635,10 +4281,11 @@ function showPermissionsDialog()
 
     local dlg = LuaDialog(ctx)
     dlg.setTitle("Permissions Status")
+    pcall(applyAccessibilityLabels, layout)
     dlg.setView(layout)
-    dlg.setPositiveButton("Open App Settings", function()
+    dlg.setPositiveButton("Open App Settings", guard("PositiveButton (line 4282)", function()
         openAppSettingsScreen()
-    end)
+    end))
     dlg.setNegativeButton("Close", nil)
     dlg.show()
 end
@@ -3653,14 +4300,20 @@ function getOnboardingDone() return aiPrefs.getBoolean("onboarding_done", false)
 function setOnboardingDone() aiEditor.putBoolean("onboarding_done", true); aiEditor.commit() end
 
 function getTutorialText()
-    return "خوش آمدید! یہ CSR AI Vision Assistant ہے۔\n\n" ..
-        "1. 'CHOOSE FROM GALLERY' سے کوئی تصویر منتخب کریں، پھر 'Process' دبائیں تاکہ AI اسے بیان کرے۔\n\n" ..
-        "2. 'BATCH PROCESS' سے ایک ساتھ کئی تصاویر منتخب کر کے پروسیس کر سکتے ہیں۔\n\n" ..
-        "3. 'START LIVE MODE' دبانے پر کیمرہ خودکار طور پر آپ کے سامنے کیا ہے وہ ہر چند سیکنڈ بعد بتاتا رہتا ہے۔ اس کے اندر 'ASK A QUESTION' بٹن سے آپ بول کر کوئی بھی سوال پوچھ سکتے ہیں۔\n\n" ..
-        "4. 'History' میں پرانے نتائج محفوظ رہتے ہیں، دوبارہ سن/دیکھ سکتے ہیں۔\n\n" ..
-        "5. 'Settings' میں API Key، AI Model، زبان، TTS آواز، اور دیگر ترتیبات مل جائیں گی۔\n\n" ..
-        "6. 'Permissions Status' سے دیکھ سکتے ہیں کہ Camera، Microphone، اور Storage پرمیشنز آن ہیں یا نہیں۔\n\n" ..
-        "جب چاہیں یہ ہدایات دوبارہ سننے کے لیے 'Help / Tutorial' بٹن دبائیں۔"
+    return "Welcome to CSR AI Vision Assistant!\n\n" ..
+        "1. Tap \"CHOOSE FROM GALLERY\" to pick a photo, select a Recognition Mode (for example Analyze Image, Extract Text Only, Translate Image Text, Summarize Document or Label & Medicine Reader), then tap \"Process\" to hear the AI's answer.\n\n" ..
+        "2. Tap \"BATCH PROCESS\" to select several photos at once and process them together.\n\n" ..
+        "3. Tap \"VOICE MESSAGE TO TEXT\" to turn a WhatsApp voice message, or any audio file, into text. Choose the language spoken in it, then pick the message from the list. You can then read it, listen to it, copy it, share it, translate it or summarize it.\n\n" ..
+        "4. Tap \"START LIVE MODE\" and the camera will keep describing what is in front of you every few seconds. Inside Live Mode, tap \"ASK A QUESTION\" and speak to ask the AI anything you like, or use the Read, Detail and Label buttons for quick answers.\n\n" ..
+        "5. \"Settings\" is where you set your API key, AI model, language, speech voice and other options.\n\n" ..
+        "6. \"More\" opens the extra tools:\n" ..
+        "• History keeps your earlier results so you can read or listen to them again.\n" ..
+        "• Diagnostics checks your API key, internet, permissions and voice in one tap and shows what is wrong.\n" ..
+        "• Permissions Status shows whether the Camera, Microphone and Storage permissions are turned on.\n" ..
+        "• Error Log shows saved errors and warnings, which you can copy and send.\n" ..
+        "• Help / Tutorial plays these instructions again.\n" ..
+        "• About & Support shows what is new, the bug fixes and the support links.\n\n" ..
+        "To hear these instructions again at any time, tap \"More\" and then \"Help / Tutorial\"."
 end
 
 function showHelpTutorialDialog()
@@ -3674,13 +4327,700 @@ function showHelpTutorialDialog()
 
     local dlg = LuaDialog(ctx)
     dlg.setTitle("Help / Tutorial")
+    pcall(applyAccessibilityLabels, scrollView)
     dlg.setView(scrollView)
     dlg.setPositiveButton("Close", nil)
-    dlg.setNeutralButton("🔊 Read Aloud", function()
+    dlg.setNeutralButton("🔊 Read Aloud", guard("NeutralButton (line 4328)", function()
         pcall(function()
             if service and service.speak then service.speak(getTutorialText()) end
         end)
+    end))
+    dlg.show()
+end
+
+-- =====================================================================
+-- DIAGNOSTICS — ایک ٹیپ میں API key، ماڈل، انٹرنیٹ، پرمیشنز، Groq سروس اور
+-- آواز (TTS/STT) چیک کر کے ہر چیز کے سامنے ✅ / ⚠️ / ❌ دکھاتا ہے
+-- =====================================================================
+function runAPITest(key, onDone)
+    local modelInfo = aiApiDetails[getAIModel()] or aiApiDetails["Qwen 3.8 27B"]
+    local testPayload = {
+        model = modelInfo.id,
+        messages = {{ role = "user", content = "Hi" }},
+        max_completion_tokens = 8,
+        stream = false
+    }
+    local ok, err = pcall(function()
+        Http.post(AI_API_URL, cjson.encode(testPayload), {
+            ["Content-Type"] = "application/json",
+            ["Authorization"] = "Bearer " .. key
+        }, guard("http callback (line 4352)", function(status, data)
+            onDone(tonumber(status) or 0, extractAIErrorMessage(data))
+        end))
     end)
+    if not ok then onDone(0, tostring(err)) end
+end
+
+function showDiagnosticsDialog()
+    local rows = {
+        { id = "key",   label = "API key" },
+        { id = "model", label = "AI model" },
+        { id = "net",   label = "Internet connection" },
+        { id = "api",   label = "Groq service (live test)" },
+        { id = "cam",   label = "Camera permission" },
+        { id = "mic",   label = "Microphone permission" },
+        { id = "store", label = "Photos / storage permission" },
+        { id = "stt",   label = "Voice input (speech recognition)" },
+        { id = "tts",   label = "Speech output engine" },
+        { id = "voice", label = "Voice for the selected language" }
+    }
+    local state = {}
+    for _, r in ipairs(rows) do state[r.id] = { icon = "⏳", detail = "checking..." } end
+
+    local scrollView = ScrollView(ctx)
+    scrollView.setFillViewport(true)
+    local tv = TextView(ctx)
+    tv.setTextSize(14)
+    tv.setPadding(30, 20, 30, 20)
+    scrollView.addView(tv)
+
+    local function reportText()
+        local lines = {}
+        for _, r in ipairs(rows) do
+            local st = state[r.id]
+            table.insert(lines, st.icon .. "  " .. r.label)
+            if st.detail and st.detail ~= "" then
+                table.insert(lines, "      " .. st.detail)
+            end
+        end
+        return table.concat(lines, "\n")
+    end
+
+    local function refresh()
+        pcall(function()
+            local text = reportText()
+            tv.setText(text)
+            tv.setContentDescription(cleanLabel(text))
+        end)
+    end
+
+    local function setRow(id, icon, detail)
+        state[id] = { icon = icon, detail = detail }
+        refresh()
+    end
+
+    -- فوری (synchronous) چیکس
+    local key = getAIApiKey()
+    if not key or key == "" then
+        setRow("key", "❌", "No API key is saved. Open Settings and enter your Groq key.")
+    elseif string.sub(key, 1, 4) ~= "gsk_" then
+        setRow("key", "⚠️", "A key is saved but it does not start with gsk_. Keys from Gemini or xAI will not work.")
+    else
+        setRow("key", "✅", "A Groq key is saved.")
+    end
+
+    local model = getAIModel()
+    if aiApiDetails[model] then
+        setRow("model", "✅", model)
+    else
+        setRow("model", "❌", "Unknown model. Choose one in Settings.")
+    end
+
+    local online = isNetworkAvailable()
+    setRow("net", online and "✅" or "❌", online and "Connected." or "No internet connection.")
+
+    setRow("cam", hasPermission(Manifest.permission.CAMERA) and "✅" or "❌", hasPermission(Manifest.permission.CAMERA) and "Granted." or "Not granted. Needed for Live Mode. Open More, then Permissions Status, to fix it.")
+    setRow("mic", hasPermission(Manifest.permission.RECORD_AUDIO) and "✅" or "❌", hasPermission(Manifest.permission.RECORD_AUDIO) and "Granted." or "Not granted. Needed for voice questions. Open More, then Permissions Status, to fix it.")
+    local storageOk = false
+    pcall(function()
+        storageOk = hasPermission(Manifest.permission.READ_MEDIA_IMAGES) or hasPermission("android.permission.READ_EXTERNAL_STORAGE")
+    end)
+    setRow("store", storageOk and "✅" or "❌", storageOk and "Granted." or "Not granted. Needed to pick photos from the gallery.")
+
+    local sttOk, sttAvail = pcall(function() return SpeechRecognizer.isRecognitionAvailable(ctx) end)
+    if sttOk and sttAvail then
+        setRow("stt", "✅", "Available on this phone.")
+    else
+        setRow("stt", "❌", "Speech recognition is not available. Install or enable the Google app / voice typing.")
+    end
+
+    -- Groq سروس کا اصل ٹیسٹ
+    if not key or key == "" or not online then
+        setRow("api", "❌", "Skipped. It needs a saved key and an internet connection.")
+    else
+        runAPITest(key, function(status, msg)
+            local why = tostring(msg or "")
+            if status == 200 then
+                setRow("api", "✅", "Working. The key and model were accepted.")
+            elseif status == 401 or status == 403 then
+                setRow("api", "❌", "The key was rejected (" .. status .. "). " .. why)
+            elseif status == 404 then
+                setRow("api", "❌", "This model is not available (404). Choose another model in Settings.")
+            elseif status == 429 then
+                setRow("api", "⚠️", "The key is valid but you are rate limited right now (429). Wait a little, or raise the Live Mode interval.")
+            elseif status == 0 then
+                setRow("api", "❌", "Could not reach Groq (network problem). " .. why)
+            else
+                setRow("api", "❌", "Unexpected response (" .. status .. "). " .. why)
+            end
+        end)
+    end
+
+    -- آواز کا انجن اور منتخب زبان کی آواز
+    local ttsStarted = pcall(function()
+        local probe = nil
+        probe = TextToSpeech(ctx, TextToSpeech.OnInitListener{
+            onInit = guard("onInit (line 4468)", function(status)
+                if status == TextToSpeech.SUCCESS then
+                    setRow("tts", "✅", "The speech engine started.")
+                    local l = LANGUAGE_TO_LOCALE[getSelectedLanguage()] or LANGUAGE_TO_LOCALE["English"]
+                    local okA, avail = pcall(function() return probe.isLanguageAvailable(Locale(l[1], l[2])) end)
+                    if okA and avail and avail >= 0 then
+                        setRow("voice", "✅", getSelectedLanguage() .. " voice is available.")
+                    else
+                        setRow("voice", "⚠️", getSelectedLanguage() .. " voice data may not be installed. Answers will still appear as text. You can install the voice in your phone's text-to-speech settings.")
+                    end
+                else
+                    setRow("tts", "❌", "The speech engine failed to start (code " .. tostring(status) .. ").")
+                    setRow("voice", "❌", "Could not be checked.")
+                end
+                pcall(function() probe.shutdown() end)
+            end)
+        })
+    end)
+    if not ttsStarted then
+        setRow("tts", "❌", "The speech engine could not be created.")
+        setRow("voice", "❌", "Could not be checked.")
+    end
+
+    local dlg = LuaDialog(ctx)
+    dlg.setTitle("Diagnostics")
+    pcall(applyAccessibilityLabels, scrollView)
+    dlg.setView(scrollView)
+    dlg.setPositiveButton("Close", nil)
+    dlg.setNeutralButton("🔊 Speak Test", guard("NeutralButton (line 4496)", function()
+        speakInSelectedLanguage("Diagnostics test. If you can hear this, speech output is working.", true)
+    end))
+    dlg.setNegativeButton("Copy Report", guard("NegativeButton (line 4499)", function()
+        local ok, err = pcall(function()
+            local clipboard = ctx.getSystemService(Context.CLIPBOARD_SERVICE)
+            clipboard.setText(reportText())
+        end)
+        if ok then notify("Report copied.") else notify("Could not copy the report.") end
+    end))
+    dlg.show()
+end
+
+-- =====================================================================
+-- VOICE MESSAGE TO TEXT — واٹس ایپ وائس میسج (یا کوئی بھی آڈیو فائل) کو Groq
+-- Whisper کے ذریعے متن میں بدلنا۔ پھر پڑھیں/سنیں/کاپی/شیئر، ترجمہ یا خلاصہ۔
+--
+-- نوٹ: فائل اپلوڈ HttpURLConnection سے ہوتی ہے (فائل کے بائٹس سیدھے
+-- FileChannel سے نیٹ ورک میں جاتے ہیں، کوئی Lua ارے نہیں بنتا)۔ یہ کام مین
+-- تھریڈ پر ہوتا ہے، اس لیے ٹرانسکرپشن کے دوران اسکرین چند سیکنڈ رک سکتی ہے۔
+-- =====================================================================
+function getSTTLanguage() return aiPrefs.getString("stt_language", "") end
+function saveSTTLanguage(label) aiEditor.putString("stt_language", label or ""); aiEditor.commit() end
+
+local STT_MODEL = "whisper-large-v3-turbo"
+local STT_URL = "https://api.groq.com/openai/v1/audio/transcriptions"
+local STT_MAX_BYTES = 25 * 1024 * 1024
+local AUDIO_EXTENSIONS = { opus = true, ogg = true, oga = true, m4a = true, mp3 = true, aac = true, amr = true, wav = true, flac = true, webm = true, mp4 = true, mpeg = true, mpga = true, ["3gp"] = true }
+-- WhatsApp کی .opus فائل دراصل Ogg ہوتی ہے؛ Groq کو "ogg" نام سے بھیجتے ہیں
+local STT_UPLOAD_EXT = { opus = "ogg", oga = "ogg", ogg = "ogg", mp3 = "mp3", m4a = "m4a", wav = "wav", flac = "flac", webm = "webm", mp4 = "mp4", mpeg = "mpeg", mpga = "mpga" }
+local STT_MIME = { ogg = "audio/ogg", mp3 = "audio/mpeg", m4a = "audio/mp4", wav = "audio/wav", flac = "audio/flac", webm = "audio/webm", mp4 = "audio/mp4", mpeg = "audio/mpeg", mpga = "audio/mpeg" }
+
+-- ایپ کی زبان کے نام سے Whisper کا ISO کوڈ (nil = خودکار پہچان)
+local function sttLanguageCode(label)
+    if not label or label == "" or label == "Auto-detect" then return nil end
+    local info = LANGUAGE_TO_LOCALE[label]
+    if not info then return nil end
+    local code = info[1]
+    if code == "fil" then code = "tl" end
+    return code
+end
+
+-- فولڈر (اور اس کے ذیلی فولڈرز) میں آڈیو فائلیں جمع کرتا ہے۔ فولڈر پڑھا جا سکے تو true
+local function collectAudioFiles(dirPath, depth, out)
+    local readable = false
+    pcall(function()
+        local dir = File_CLASS(dirPath)
+        if dir.exists() and dir.isDirectory() then
+            local arr = dir.listFiles()
+            if arr then
+                readable = true
+                local lst = Arrays.asList(arr)
+                for i = 0, lst.size() - 1 do
+                    local f = lst.get(i)
+                    local name = tostring(f.getName())
+                    if f.isDirectory() then
+                        if depth < 2 then
+                            collectAudioFiles(tostring(f.getAbsolutePath()), depth + 1, out)
+                        end
+                    else
+                        local ext = (name:match("%.([%w]+)$") or ""):lower()
+                        if AUDIO_EXTENSIONS[ext] then
+                            table.insert(out, {
+                                path = tostring(f.getAbsolutePath()),
+                                name = name,
+                                time = tonumber(f.lastModified()) or 0,
+                                size = tonumber(f.length()) or 0
+                            })
+                        end
+                    end
+                end
+            end
+        end
+    end)
+    return readable
+end
+
+local function listWhatsAppVoiceNotes()
+    local base = os.getenv("EXTERNAL_STORAGE") or "/storage/emulated/0"
+    local dirs = {
+        base .. "/Android/media/com.whatsapp/WhatsApp/Media/WhatsApp Voice Notes",
+        base .. "/Android/media/com.whatsapp/WhatsApp/Media/WhatsApp Audio",
+        base .. "/WhatsApp/Media/WhatsApp Voice Notes",
+        base .. "/WhatsApp/Media/WhatsApp Audio",
+        base .. "/Android/media/com.whatsapp.w4b/WhatsApp Business/Media/WhatsApp Business Voice Notes",
+        base .. "/WhatsApp Business/Media/WhatsApp Business Voice Notes"
+    }
+    local files = {}
+    local anyReadable = false
+    for _, d in ipairs(dirs) do
+        if collectAudioFiles(d, 0, files) then anyReadable = true end
+    end
+    table.sort(files, function(a, b) return a.time > b.time end)
+    while #files > 60 do table.remove(files) end
+    return files, anyReadable
+end
+
+-- گیلری/میڈیا میں موجود دیگر آڈیو فائلیں (MediaStore سے)
+local function listMediaStoreAudio()
+    local files = {}
+    pcall(function()
+        local resolver = ctx.getContentResolver()
+        local projection = { MediaStore.Audio.Media.DATA, MediaStore.Audio.Media.DISPLAY_NAME, MediaStore.Audio.Media.DATE_ADDED, MediaStore.Audio.Media.SIZE }
+        local cursor = resolver.query(MediaStore.Audio.Media.EXTERNAL_CONTENT_URI, projection, nil, nil, MediaStore.Audio.Media.DATE_ADDED .. " DESC")
+        if cursor ~= nil then
+            local dataCol = cursor.getColumnIndexOrThrow(MediaStore.Audio.Media.DATA)
+            local nameCol = cursor.getColumnIndexOrThrow(MediaStore.Audio.Media.DISPLAY_NAME)
+            local dateCol = cursor.getColumnIndexOrThrow(MediaStore.Audio.Media.DATE_ADDED)
+            local sizeCol = cursor.getColumnIndexOrThrow(MediaStore.Audio.Media.SIZE)
+            while cursor.moveToNext() and #files < 100 do
+                local path = cursor.getString(dataCol)
+                local name = cursor.getString(nameCol)
+                if path and name then
+                    table.insert(files, {
+                        path = tostring(path),
+                        name = tostring(name),
+                        time = (tonumber(cursor.getLong(dateCol)) or 0) * 1000,
+                        size = tonumber(cursor.getLong(sizeCol)) or 0
+                    })
+                end
+            end
+            cursor.close()
+        end
+    end)
+    return files
+end
+
+-- ایک کوشش: فائل کو Groq Whisper پر بھیج کر متن لاتا ہے۔ (text, errorMessage, httpStatus)
+local function groqTranscribeOnce(path, langCode)
+    local apiKey = getAIApiKey()
+    if not apiKey or apiKey == "" then
+        return nil, "API Key missing! Set it in Settings.", 0
+    end
+    local file = File_CLASS(path)
+    if not file.exists() or not file.canRead() then
+        return nil, "The audio file cannot be read. It may have been moved or deleted, or the app may not have file access.", 0
+    end
+    local size = tonumber(file.length()) or 0
+    if size <= 0 then return nil, "The audio file is empty.", 0 end
+    if size > STT_MAX_BYTES then
+        return nil, "This audio file is too large (" .. string.format("%.1f", size / 1048576) .. " MB). Groq's free limit is 25 MB.", 0
+    end
+
+    local name = tostring(file.getName())
+    local ext = (name:match("%.([%w]+)$") or ""):lower()
+    local sendExt = STT_UPLOAD_EXT[ext]
+    if not sendExt then
+        return nil, "The audio format \"." .. ext .. "\" is not supported by Groq. Supported: opus/ogg, mp3, m4a, wav, flac, webm, mp4.", 0
+    end
+    local uploadName = "voice." .. sendExt
+    local mime = STT_MIME[sendExt] or "application/octet-stream"
+
+    -- مین تھریڈ پر نیٹ ورک کی اجازت (ورنہ NetworkOnMainThreadException آتا ہے)
+    pcall(function()
+        local StrictMode = luajava.bindClass("android.os.StrictMode")
+        StrictMode.setThreadPolicy(StrictMode.ThreadPolicy.Builder().permitAll().build())
+    end)
+
+    local boundary = "----CSRAudioBoundary" .. tostring(os.time()) .. tostring(math.random(100000, 999999))
+    local CRLF = "\r\n"
+    local function field(fname, value)
+        return "--" .. boundary .. CRLF .. 'Content-Disposition: form-data; name="' .. fname .. '"' .. CRLF .. CRLF .. tostring(value) .. CRLF
+    end
+    local preamble = field("model", STT_MODEL) .. field("response_format", "json") .. field("temperature", "0")
+    if langCode then preamble = preamble .. field("language", langCode) end
+    preamble = preamble .. "--" .. boundary .. CRLF ..
+        'Content-Disposition: form-data; name="file"; filename="' .. uploadName .. '"' .. CRLF ..
+        "Content-Type: " .. mime .. CRLF .. CRLF
+    local epilogue = CRLF .. "--" .. boundary .. "--" .. CRLF
+
+    local statusCode = 0
+    local body = ""
+    local fis = nil
+    local ok, err = pcall(function()
+        local conn = URL(STT_URL).openConnection()
+        conn.setRequestMethod("POST")
+        conn.setDoOutput(true)
+        conn.setConnectTimeout(15000)
+        conn.setReadTimeout(120000)
+        -- بڑی فائل کو پوری میموری میں جمع کیے بغیر ٹکڑوں میں بھیجیں
+        if size > 4 * 1048576 then conn.setChunkedStreamingMode(0) end
+        conn.setRequestProperty("Authorization", "Bearer " .. apiKey)
+        conn.setRequestProperty("Content-Type", "multipart/form-data; boundary=" .. boundary)
+
+        local out = conn.getOutputStream()
+        local writer = OutputStreamWriter(out, "UTF-8")
+        writer.write(preamble)
+        writer.flush()
+
+        fis = FileInputStream(file)
+        local channel = fis.getChannel()
+        local target = Channels.newChannel(out)
+        local pos = 0
+        while pos < size do
+            local moved = tonumber(channel.transferTo(pos, size - pos, target)) or 0
+            if moved <= 0 then break end
+            pos = pos + moved
+        end
+        pcall(function() fis.close() end)
+        fis = nil
+
+        writer.write(epilogue)
+        writer.flush()
+        out.flush()
+        out.close()
+
+        statusCode = tonumber(conn.getResponseCode()) or 0
+        local stream = nil
+        if statusCode >= 200 and statusCode < 300 then
+            stream = conn.getInputStream()
+        else
+            stream = conn.getErrorStream()
+        end
+        if stream then
+            local reader = BufferedReader(InputStreamReader(stream, "UTF-8"))
+            local parts = {}
+            local line = reader.readLine()
+            while line ~= nil do
+                table.insert(parts, tostring(line))
+                line = reader.readLine()
+            end
+            reader.close()
+            body = table.concat(parts, "\n")
+        end
+    end)
+    if fis then pcall(function() fis.close() end) end
+
+    if not ok then
+        logError("groqTranscribeOnce failed: " .. tostring(err))
+        return nil, "Could not reach Groq (network problem): " .. tostring(err), 0
+    end
+
+    if statusCode == 200 then
+        local decodeOk, decoded = pcall(cjson.decode, body)
+        if decodeOk and type(decoded) == "table" and type(decoded.text) == "string" then
+            return decoded.text, nil, 200
+        end
+        return nil, "Groq returned an unexpected answer.", 200
+    end
+
+    local msg = extractAIErrorMessage(body)
+    if statusCode == 401 or statusCode == 403 then
+        return nil, "Groq rejected the API key (" .. statusCode .. "). " .. tostring(msg or ""), statusCode
+    elseif statusCode == 413 then
+        return nil, "The audio file is too large for Groq.", statusCode
+    elseif statusCode == 429 then
+        local wait = parseRetryAfterSeconds(msg)
+        return nil, "Groq's free limit for audio was reached" .. (wait and (". Try again in about " .. formatDuration(wait)) or "") .. ".", statusCode
+    end
+    return nil, "Error " .. tostring(statusCode) .. ": " .. tostring(msg or "no details"), statusCode
+end
+
+local function groqTranscribe(path, langCode)
+    local text, err, status = groqTranscribeOnce(path, langCode)
+    -- اگر Groq کو منتخب زبان کا کوڈ پسند نہ آئے (400) تو خودکار پہچان کے ساتھ ایک بار دوبارہ
+    if not text and status == 400 and langCode and string.find(string.lower(tostring(err)), "language", 1, true) then
+        text, err, status = groqTranscribeOnce(path, nil)
+    end
+    return text, err, status
+end
+
+function beginVoiceTranscription(path, langCode)
+    local apiKey = getAIApiKey()
+    if not apiKey or apiKey == "" then
+        vibratePattern("error")
+        notify("API Key missing! Set it in Settings.")
+        return
+    end
+    if not isNetworkAvailable() then
+        vibratePattern("error")
+        notify("No internet connection.")
+        return
+    end
+    vibratePattern("processing")
+    notify("Turning the voice message into text. Please wait, the screen may pause for a few seconds.")
+    -- تھوڑی دیر بعد شروع کریں تاکہ اوپر کا پیغام بولا جا سکے
+    local handler = Handler(Looper.getMainLooper())
+    handler.postDelayed(Runnable({ run = guard("run (line 4773)", function()
+        local text, err = groqTranscribe(path, langCode)
+        if text then
+            text = tostring(text):gsub("^%s+", ""):gsub("%s+$", "")
+            if text == "" then
+                vibratePattern("error")
+                notify("No speech was detected in this audio.")
+                return
+            end
+            saveHistoryEntry("Voice Message to Text", text)
+            vibratePattern("success")
+            showResultDialog("Voice Message — Text", text, { textActions = true })
+        else
+            vibratePattern("error")
+            logError("Voice transcription failed: " .. tostring(err))
+            pcall(reportError, "Voice Message to Text", tostring(err), "File: " .. tostring(path))
+            notify(tostring(err))
+        end
+    end) }), 600)
+end
+
+-- بڑی فائل (6 MB سے اوپر) پر پہلے تصدیق، کیونکہ اپلوڈ کے دوران اسکرین رک سکتی ہے
+function startVoiceTranscription(path, langCode)
+    local sizeBytes = 0
+    pcall(function() sizeBytes = tonumber(File_CLASS(path).length()) or 0 end)
+    if sizeBytes > 6 * 1048576 then
+        local tv = TextView(ctx)
+        tv.setText("This audio file is about " .. string.format("%.1f", sizeBytes / 1048576) .. " MB. Uploading it can take up to a minute, and the screen may freeze until it finishes. Continue?")
+        tv.setTextSize(14)
+        tv.setPadding(30, 20, 30, 20)
+        local dlg = LuaDialog(ctx)
+        dlg.setTitle("Large audio file")
+        dlg.setView(tv)
+        dlg.setPositiveButton("Continue", guard("PositiveButton (line 4806)", function() beginVoiceTranscription(path, langCode) end))
+        dlg.setNegativeButton("Cancel", nil)
+        dlg.show()
+    else
+        beginVoiceTranscription(path, langCode)
+    end
+end
+
+-- متن پر AI ایکشن: ترجمہ یا خلاصہ
+function runTextAction(kind, text)
+    local apiKey = getAIApiKey()
+    if not apiKey or apiKey == "" then
+        notify("API Key missing! Set it in Settings.")
+        return
+    end
+    local lang = getSelectedLanguage()
+    local body = tostring(text or "")
+    body = safeUtf8Cut(body, 6000)
+    local prompt
+    if kind == "translate" then
+        prompt = "Translate the following voice message transcript into " .. lang .. ". Output ONLY the translation, with no notes or labels. If it is already in " .. lang .. ", return it unchanged.\n\nTranscript:\n" .. body
+    else
+        prompt = "Summarize the following voice message transcript in 2 to 4 short sentences. Keep names, numbers, dates, places and any request or deadline exactly. IMPORTANT: reply ONLY in " .. lang .. ", with no words from any other language (unless " .. lang .. " itself is English).\n\nTranscript:\n" .. body
+    end
+    showProgress("Working...")
+    callAIWithImage(apiKey, getAIModel(), nil, prompt, function(res, err)
+        hideProgress()
+        if res then
+            saveHistoryEntry(kind == "translate" and "Voice Message Translation" or "Voice Message Summary", res)
+            vibratePattern("success")
+            showResultDialog(kind == "translate" and "Translation" or "Summary", res)
+        else
+            vibratePattern("error")
+            notify("Error: " .. tostring(err))
+        end
+    end, { maxTokens = 900, noCache = true })
+end
+
+-- فائلوں کی فہرست دکھاتا ہے؛ کسی پر ٹیپ کرنے سے ٹرانسکرپشن شروع
+local function showAudioFileList(files, title, langCode)
+    local labels = {}
+    for _, f in ipairs(files) do
+        local timeText = ""
+        pcall(function() timeText = os.date("%Y-%m-%d %H:%M", math.floor(f.time / 1000)) end)
+        local sizeText = math.max(1, math.floor(f.size / 1024)) .. " KB"
+        if f.size >= 1048576 then sizeText = string.format("%.1f", f.size / 1048576) .. " MB" end
+        table.insert(labels, f.name .. "  —  " .. timeText .. "  (" .. sizeText .. ")")
+    end
+    local listLayout = LinearLayout(ctx)
+    listLayout.setOrientation(1)
+    local listView = ListView(ctx)
+    listView.setAdapter(ArrayAdapter(ctx, android.R.layout.simple_list_item_1, labels))
+    listLayout.addView(listView)
+
+    local listDlg = LuaDialog(ctx)
+    listDlg.setTitle(title)
+    listDlg.setView(listLayout)
+    listDlg.setPositiveButton("Cancel", nil)
+    listDlg.show()
+
+    listView.setOnItemClickListener(AdapterView.OnItemClickListener{
+        onItemClick = guard("onItemClick (line 4867)", function(p, v, pos, id)
+            local f = files[pos + 1]
+            listDlg.dismiss()
+            if f then startVoiceTranscription(f.path, langCode) end
+        end)
+    })
+end
+
+-- Android 11+ پر دوسری ایپ کے فولڈر (Android/media) کے لیے "All files access" کی سیٹنگ کھولتا ہے
+local function openAllFilesAccessSettings()
+    local ok = pcall(function()
+        local intent = Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION)
+        intent.setData(Uri.parse("package:" .. tostring(ctx.getPackageName())))
+        intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        ctx.startActivity(intent)
+    end)
+    if not ok then openAppSettingsScreen() end
+end
+
+function showVoiceToTextDialog()
+    local layout = LinearLayout(ctx)
+    layout.setOrientation(1)
+    layout.setPadding(30, 20, 30, 20)
+
+    local intro = TextView(ctx)
+    intro.setText("Turn a WhatsApp voice message (or any audio file) into text. First choose the language that is spoken in the voice message, then choose where to look for it.")
+    intro.setTextSize(13)
+    layout.addView(intro)
+
+    local langLabel = TextView(ctx)
+    langLabel.setText("Language spoken in the voice message:")
+    langLabel.setPadding(0, 15, 0, 0)
+    layout.addView(langLabel)
+
+    local choices = { "Auto-detect" }
+    for _, l in ipairs(POPULAR_LANGUAGES) do table.insert(choices, l) end
+    local langSpinner = Spinner(ctx)
+    langSpinner.setAdapter(ArrayAdapter(ctx, android.R.layout.simple_spinner_item, choices))
+    pcall(function() langSpinner.setContentDescription("Language spoken in the voice message") end)
+    local saved = getSTTLanguage()
+    if saved == "" then saved = getSelectedLanguage() end
+    for i = 1, #choices do
+        if choices[i] == saved then langSpinner.setSelection(i - 1) break end
+    end
+    layout.addView(langSpinner)
+
+    local hint = TextView(ctx)
+    hint.setText("Tip: for Urdu messages choose Urdu. Auto-detect can mistake Urdu for Hindi.")
+    hint.setTextSize(12)
+    hint.setTextColor(0xFF888888)
+    hint.setPadding(0, 5, 0, 15)
+    layout.addView(hint)
+
+    local function currentChoice()
+        local label = choices[langSpinner.getSelectedItemPosition() + 1] or "Auto-detect"
+        saveSTTLanguage(label)
+        return sttLanguageCode(label)
+    end
+
+    local dlg = LuaDialog(ctx)
+
+    local btnWA = Button(ctx)
+    btnWA.setText("📱 WhatsApp Voice Notes")
+    btnWA.onClick = guard("onClick (line 4930)", function()
+        local code = currentChoice()
+        local files, anyReadable = listWhatsAppVoiceNotes()
+        if #files > 0 then
+            dlg.dismiss()
+            showAudioFileList(files, "WhatsApp Voice Notes (newest first)", code)
+        elseif not anyReadable then
+            vibratePattern("error")
+            notify("The WhatsApp folder cannot be read. On Android 11 or newer, tap Allow File Access below. You can also copy the voice message to your Downloads folder and use Other Audio Files.")
+        else
+            notify("No voice notes were found in the WhatsApp folder.")
+        end
+    end)
+    layout.addView(btnWA)
+
+    local btnOther = Button(ctx)
+    btnOther.setText("🎵 Other Audio Files")
+    btnOther.onClick = guard("onClick (line 4947)", function()
+        local code = currentChoice()
+        local files = listMediaStoreAudio()
+        if #files > 0 then
+            dlg.dismiss()
+            showAudioFileList(files, "Audio Files (newest first)", code)
+        else
+            vibratePattern("error")
+            notify("No audio files were found, or the app has no permission to see them. Check Permissions Status in the More menu.")
+        end
+    end)
+    layout.addView(btnOther)
+
+    local btnAccess = Button(ctx)
+    btnAccess.setText("🔓 Allow File Access (Android 11+)")
+    btnAccess.onClick = guard("onClick (line 4962)", function()
+        dlg.dismiss()
+        openAllFilesAccessSettings()
+    end)
+    layout.addView(btnAccess)
+
+    local scroll = ScrollView(ctx)
+    scroll.setFillViewport(true)
+    scroll.addView(layout)
+    dlg.setTitle("Voice Message to Text")
+    pcall(applyAccessibilityLabels, scroll)
+    dlg.setView(scroll)
+    dlg.setPositiveButton("Close", nil)
+    dlg.show()
+end
+
+-- =====================================================================
+-- MORE مینو — Help / Tutorial، Diagnostics، Permissions Status، History اور
+-- About & Support اب مین اسکرین کی بجائے اس ایک "More" بٹن کے اندر ہیں
+-- =====================================================================
+function showMoreMenu()
+    local scroll = ScrollView(ctx)
+    scroll.setFillViewport(true)
+    local layout = LinearLayout(ctx)
+    layout.setOrientation(1)
+    layout.setPadding(30, 20, 30, 20)
+    scroll.addView(layout)
+
+    local dlg = LuaDialog(ctx)
+
+    local function addItem(label, description, action)
+        local b = Button(ctx)
+        b.setText(label)
+        b.setContentDescription(description)
+        b.setLayoutParams(LinearLayout.LayoutParams(-1, -2))
+        b.onClick = guard("onClick (line 4997)", function()
+            dlg.dismiss()
+            local ok, err = pcall(action)
+            if not ok then
+                logError("More menu item failed: " .. tostring(err))
+                notify("Could not open this screen: " .. tostring(err))
+            end
+        end)
+        layout.addView(b)
+    end
+
+    addItem("❓ Help / Tutorial", "Help and tutorial", showHelpTutorialDialog)
+    addItem("🩺 Diagnostics", "Diagnostics: check key, internet, permissions and voice", showDiagnosticsDialog)
+    addItem("🔐 Permissions Status", "Permissions status", showPermissionsDialog)
+    addItem("🗂 History", "History of saved results", showHistoryDialog)
+    addItem("🐞 Error Log", "Error log: saved errors and warnings", showErrorLogDialog)
+    addItem("ℹ️ About & Support", "About and support", aboutAndSupport)
+
+    dlg.setTitle("More")
+    pcall(applyAccessibilityLabels, scroll)
+    dlg.setView(scroll)
+    dlg.setPositiveButton("Close", nil)
     dlg.show()
 end
 
@@ -3703,32 +5043,39 @@ function createMainUI()
     
     local btnScan = Button(ctx)
     btnScan.setText("CHOOSE FROM GALLERY")
-    btnScan.onClick = function() scanAllImages() end
+    btnScan.onClick = guard("onClick (line 5041)", function() scanAllImages() end)
     layout.addView(btnScan)
 
     -- Batch Processing بٹن — ایک ساتھ کئی تصاویر منتخب اور پروسیس کریں
     local btnBatch = Button(ctx)
     btnBatch.setText("BATCH PROCESS (Multiple Images)")
-    btnBatch.onClick = function()
+    btnBatch.onClick = guard("onClick (line 5047)", function()
         scanAllImagesForBatch(function(selectedPaths)
             processBatchImages(selectedPaths)
         end)
-    end
+    end)
     layout.addView(btnBatch)
+
+    -- Voice Message to Text بٹن
+    local btnVoiceText = Button(ctx)
+    btnVoiceText.setText("🎙 VOICE MESSAGE TO TEXT")
+    btnVoiceText.setContentDescription("Voice message to text: turn a WhatsApp voice message or an audio file into text")
+    btnVoiceText.onClick = guard("onClick (line 5058)", function() showVoiceToTextDialog() end)
+    layout.addView(btnVoiceText)
     
     -- Live/Continuous Mode بٹن
     local btnLiveMode = Button(ctx)
     btnLiveMode.setText("START LIVE MODE (Continuous)")
     btnLiveMode.setBackgroundColor(0xFF2196F3)
     btnLiveMode.setTextColor(0xFFFFFFFF)
-    btnLiveMode.onClick = function()
+    btnLiveMode.onClick = guard("onClick (line 5066)", function()
         local apiKey = getAIApiKey()
         if not apiKey or apiKey == "" then
             notify("API Key missing! پہلے Settings میں سیٹ کریں")
             return
         end
         startLiveMode()
-    end
+    end)
     layout.addView(btnLiveMode)
     
     _G.statusLabel = TextView(ctx)
@@ -3750,9 +5097,10 @@ function createMainUI()
         if POPULAR_LANGUAGES[i] == savedLang then langSpinner.setSelection(i - 1) end
     end
     langSpinner.setOnItemSelectedListener(AdapterView.OnItemSelectedListener{
-        onItemSelected = function(p, v, pos, id) saveSelectedLanguage(POPULAR_LANGUAGES[pos + 1]) end
+        onItemSelected = guard("onItemSelected (line 5095)", function(p, v, pos, id) saveSelectedLanguage(POPULAR_LANGUAGES[pos + 1]) end)
     })
     layout.addView(langSpinner)
+    pcall(function() langSpinner.setContentDescription("Output language") end)
     
     local recLabel = TextView(ctx)
     recLabel.setText("Recognition Mode:")
@@ -3768,14 +5116,16 @@ function createMainUI()
         if RECOGNIZE_OPTIONS[i] == savedOpt then recSpinner.setSelection(i - 1) end
     end
     recSpinner.setOnItemSelectedListener(AdapterView.OnItemSelectedListener{
-        onItemSelected = function(p, v, pos, id) saveSelectedRecognizeOption(RECOGNIZE_OPTIONS[pos + 1]) end
+        onItemSelected = guard("onItemSelected (line 5114)", function(p, v, pos, id) saveSelectedRecognizeOption(RECOGNIZE_OPTIONS[pos + 1]) end)
     })
     layout.addView(recSpinner)
+    pcall(function() recSpinner.setContentDescription("Recognition mode") end)
     
     processButton = Button(ctx)
     processButton.setText("Process")
+    pcall(function() processButton.setContentDescription("Process the selected image or mode") end)
     processButton.setBackgroundColor(0xFFFF9800)
-    processButton.onClick = function()
+    processButton.onClick = guard("onClick (line 5123)", function()
         processButton.setEnabled(false)
         processButton.setText("Processing...")
         vibratePattern("processing")
@@ -3786,23 +5136,23 @@ function createMainUI()
         if selectedOption == "Current Screen" then
             if mainDlg then mainDlg.dismiss() mainDlg = nil end
             local handler = Handler(Looper.getMainLooper())
-            handler.postDelayed(Runnable({ run = function()
+            handler.postDelayed(Runnable({ run = guard("run (line 5134)", function()
                 local result = analyzeCurrentScreen()
                 showResultDialog("Screen Analysis", result)
                 saveHistoryEntry("Current Screen", result)
                 vibratePattern("success")
                 processButton.setEnabled(true); processButton.setText("Process"); processButton.setBackgroundColor(0xFFFF9800)
-            end }), 100)
+            end) }), 100)
         elseif selectedOption == "Current Item" then
             if mainDlg then mainDlg.dismiss() mainDlg = nil end
             local handler = Handler(Looper.getMainLooper())
-            handler.postDelayed(Runnable({ run = function()
+            handler.postDelayed(Runnable({ run = guard("run (line 5144)", function()
                 local result = analyzeCurrentItem()
                 showResultDialog("Item Analysis", result)
                 saveHistoryEntry("Current Item", result)
                 vibratePattern("success")
                 processButton.setEnabled(true); processButton.setText("Process"); processButton.setBackgroundColor(0xFFFF9800)
-            end }), 100)
+            end) }), 100)
         elseif selectedOption == "Analyze Image" or selectedOption == "Extract Text Only" or selectedOption == "Translate Image Text" or selectedOption == "Summarize Document" or selectedOption == "Label & Medicine Reader" then
             if selectedPhotoPath == "" and not selectedPhotoUri then
                 vibratePattern("error")
@@ -3860,7 +5210,7 @@ function createMainUI()
             callAIWithImage(apiKey, getAIModel(), base64Data, prompt, function(res, err)
                 hideProgress()
                 if res then
-                    showResultDialog("Analysis Result", res)
+                    showResultDialog("Analysis Result", res, { followUp = { image = base64Data, mode = selectedOption } })
                     saveHistoryEntry(selectedOption, res)
                     vibratePattern("success")
                 else
@@ -3870,7 +5220,7 @@ function createMainUI()
                 processButton.setEnabled(true); processButton.setText("Process"); processButton.setBackgroundColor(0xFFFF9800)
             end)
         end
-    end
+    end)
     layout.addView(processButton)
     
     local bottomLayout = LinearLayout(ctx)
@@ -3881,53 +5231,31 @@ function createMainUI()
     local btnSettings = Button(ctx)
     btnSettings.setText("Settings")
     btnSettings.setLayoutParams(LinearLayout.LayoutParams(0, -2, 1))
-    btnSettings.onClick = function() showAISettingsDialog() end
+    btnSettings.onClick = guard("onClick (line 5229)", function() showAISettingsDialog() end)
     bottomLayout.addView(btnSettings)
     
-    local btnAbout = Button(ctx)
-    btnAbout.setText("About & Support")
-    btnAbout.setLayoutParams(LinearLayout.LayoutParams(0, -2, 1))
-    btnAbout.onClick = function() aboutAndSupport() end
-    bottomLayout.addView(btnAbout)
+    local btnMore = Button(ctx)
+    btnMore.setText("More")
+    btnMore.setContentDescription("More options: help, diagnostics, permissions, history, about and support")
+    btnMore.setLayoutParams(LinearLayout.LayoutParams(0, -2, 1))
+    btnMore.onClick = guard("onClick (line 5236)", function() showMoreMenu() end)
+    bottomLayout.addView(btnMore)
     
     local btnExit = Button(ctx)
     btnExit.setText("Exit")
     btnExit.setLayoutParams(LinearLayout.LayoutParams(0, -2, 1))
     btnExit.setBackgroundColor(0xFFF44336)
-    btnExit.onClick = function()
+    btnExit.onClick = guard("onClick (line 5243)", function()
         pcall(function() stopLiveMode() end)
         if mainDlg then mainDlg.dismiss() mainDlg = nil end
-    end
+    end)
     bottomLayout.addView(btnExit)
     
     layout.addView(bottomLayout)
 
-    -- محفوظ شدہ نتائج دیکھنے کا بٹن (History System)
-    local btnHistory = Button(ctx)
-    btnHistory.setText("History")
-    btnHistory.setLayoutParams(LinearLayout.LayoutParams(-1, -2))
-    btnHistory.setPadding(0, 10, 0, 0)
-    btnHistory.onClick = function() showHistoryDialog() end
-    layout.addView(btnHistory)
-
-    -- Permissions Status بٹن
-    local btnPermissions = Button(ctx)
-    btnPermissions.setText("🔐 Permissions Status")
-    btnPermissions.setLayoutParams(LinearLayout.LayoutParams(-1, -2))
-    btnPermissions.setPadding(0, 10, 0, 0)
-    btnPermissions.onClick = function() showPermissionsDialog() end
-    layout.addView(btnPermissions)
-
-    -- Help/Tutorial بٹن
-    local btnHelp = Button(ctx)
-    btnHelp.setText("❓ Help / Tutorial")
-    btnHelp.setLayoutParams(LinearLayout.LayoutParams(-1, -2))
-    btnHelp.setPadding(0, 10, 0, 0)
-    btnHelp.onClick = function() showHelpTutorialDialog() end
-    layout.addView(btnHelp)
-    
     mainDlg = LuaDialog(ctx)
-    mainDlg.setTitle("CSR AI Vision Assistant")
+    mainDlg.setTitle("CSR AI Vision Assistant " .. APP_VERSION)
+    pcall(applyAccessibilityLabels, scrollMain)
     mainDlg.setView(scrollMain)
     mainDlg.show()
 
@@ -3935,9 +5263,9 @@ function createMainUI()
     if not getOnboardingDone() then
         setOnboardingDone()
         local handler = Handler(Looper.getMainLooper())
-        handler.postDelayed(Runnable({ run = function()
+        handler.postDelayed(Runnable({ run = guard("run (line 5261)", function()
             pcall(function() showHelpTutorialDialog() end)
-        end }), 500)
+        end) }), 500)
     end
 end
 
@@ -3945,4 +5273,7 @@ logInfo("CSR AI Vision Assistant started. Model=" .. getAIModel() .. " Language=
 if isShakeEnabled() then
     pcall(registerShakeListener)
 end
-createMainUI()
+local startOk, startErr = pcall(createMainUI)
+if not startOk then
+    pcall(reportError, "Starting the app", tostring(startErr))
+end
