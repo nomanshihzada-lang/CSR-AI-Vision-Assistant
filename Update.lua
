@@ -548,6 +548,9 @@ function saveSpeechPitch(pitch) aiEditor.putFloat("speech_pitch", pitch); aiEdit
 function getTTSEnginePackage() return aiPrefs.getString("tts_engine_pkg", "") end
 function saveTTSEnginePackage(pkg) aiEditor.putString("tts_engine_pkg", pkg or ""); aiEditor.commit() end
 function getTTSVoiceName() return aiPrefs.getString("tts_voice_name", "") end
+DEFAULT_MODE_OPTIONS = { "None", "Live Mode", "Camera Mode", "Find Object", "Document Reader", "Voice Message to Text", "Light Detector" }
+function getDefaultMode() return aiPrefs.getString("default_mode", "None") end
+function saveDefaultMode(mode) aiEditor.putString("default_mode", mode or "None"); aiEditor.commit() end
 function saveTTSVoiceName(name) aiEditor.putString("tts_voice_name", name or ""); aiEditor.commit() end
 
 -- نئے ٹوگلز: نتائج خودکار پڑھنا، لائیو موڈ میں صرف تبدیلی پر بولنا، ہسٹری محفوظ کرنا
@@ -586,6 +589,18 @@ function recordTokenUsage(usage)
     local promptTokens = tonumber(usage.input_tokens) or tonumber(usage.prompt_tokens) or 0
     local responseTokens = tonumber(usage.output_tokens) or tonumber(usage.completion_tokens) or 0
     local totalTokens = tonumber(usage.total_tokens) or (promptTokens + responseTokens)
+
+    -- پچھلے 60 سیکنڈ کا ٹوکن حساب (حد سے پہلے ہی رک جانے کے لیے)
+    pcall(function()
+        runtimeState.tokenWindow = runtimeState.tokenWindow or {}
+        local now = os.time()
+        table.insert(runtimeState.tokenWindow, { t = now, input = promptTokens, output = responseTokens })
+        local keep = {}
+        for _, e in ipairs(runtimeState.tokenWindow) do
+            if now - e.t < 120 then table.insert(keep, e) end
+        end
+        runtimeState.tokenWindow = keep
+    end)
 
     pcall(function()
         local today = getTodayDateString()
@@ -1194,8 +1209,49 @@ local function formatDuration(sec)
     return string.format("%.1f", sec / 3600) .. " hours"
 end
 
+-- Groq کے 429 پیغام سے اس اکاؤنٹ کی اصل حدیں سیکھتا ہے، مثلاً
+-- "on input tokens per minute (ITPM): Limit 7000" یا "(OTPM): Limit 1000"
+local function learnLimitsFromMessage(msg)
+    if not msg then return end
+    runtimeState.limits = runtimeState.limits or {}
+    for name, value in tostring(msg):gmatch("%((%u+)%):%s*Limit%s+(%d+)") do
+        runtimeState.limits[name] = tonumber(value)
+    end
+end
+
+-- کتنے سیکنڈ بعد اتنے ٹوکن حد پار کیے بغیر بھیجے جا سکتے ہیں (0 = ابھی)۔ یہ تب ہی
+-- کام کرتا ہے جب Groq کوئی حد بتا چکا ہو (اپ گریڈ شدہ پلان پر بلاوجہ انتظار نہیں)
+function secondsUntilBudget(estInput, estOutput)
+    local limits = runtimeState.limits
+    if not limits then return 0 end
+    local win = runtimeState.tokenWindow or {}
+    local now = os.time()
+    local function needed(limit, key, est)
+        if not limit then return 0 end
+        limit = limit * 0.9
+        local entries = {}
+        for _, e in ipairs(win) do
+            if now - e.t < 60 then table.insert(entries, e) end
+        end
+        table.sort(entries, function(a, b) return a.t < b.t end)
+        local total = est
+        for _, e in ipairs(entries) do total = total + (e[key] or 0) end
+        if total <= limit then return 0 end
+        local wait = 0
+        for _, e in ipairs(entries) do
+            total = total - (e[key] or 0)
+            wait = (e.t + 60) - now
+            if total <= limit then break end
+        end
+        return math.max(0, wait + 1)
+    end
+    local w1 = needed(limits.ITPM or limits.TPM, "input", estInput or 0)
+    local w2 = needed(limits.OTPM, "output", estOutput or 0)
+    return math.max(w1, w2)
+end
+
 -- ایک ہی کوشش (attempt) کے لیے Groq کو HTTP کال
--- onDone(text, errorMessage, retryable, httpStatus, retryAfterSeconds)
+-- onDone(text, errorMessage, retryable, httpStatus, retryAfterSeconds, kind, extra)
 local function attemptAICall(apiKey, payload, attemptNumber, model, onDone)
     local headers = {
         ["Content-Type"] = "application/json",
@@ -1237,6 +1293,17 @@ local function attemptAICall(apiKey, payload, attemptNumber, model, onDone)
                 local msg = extractAIErrorMessage(data)
                 local wait = parseRetryAfterSeconds(msg)
                 local lower = string.lower(tostring(msg or ""))
+                learnLimitsFromMessage(msg)
+                -- "Request too large": مانگے گئے آؤٹ پٹ ٹوکن حد سے زیادہ ہیں؛ انتظار نہیں، سائز کم کر کے فوراً دوبارہ
+                if status == 429 and string.find(lower, "request too large", 1, true) then
+                    local limit = tonumber(string.match(tostring(msg), "Limit%s+(%d+)"))
+                    if string.find(lower, "output tokens", 1, true) and limit then
+                        onDone(nil, "The answer size was too big for Groq's free per-minute output limit (" .. limit .. " tokens). Shrinking it and trying again.", false, status, nil, "reduce_output", math.max(100, math.floor(limit * 0.6)))
+                    else
+                        onDone(nil, "This request is bigger than Groq's free per-minute limit allows (" .. tostring(string.match(tostring(msg), "%(([%u]+)%)") or "tokens") .. "). Try again with a smaller image or less text.", false, status)
+                    end
+                    return
+                end
                 local daily = string.find(lower, "per day", 1, true) or string.find(lower, "(tpd)", 1, true) or string.find(lower, "(rpd)", 1, true)
                 local friendly
                 if status == 408 then
@@ -1334,7 +1401,7 @@ end
 -- opts.maxTokens: جواب کی زیادہ سے زیادہ لمبائی (Live Mode میں چھوٹی رکھی جاتی ہے)
 function callAIWithImage(apiKey, model, base64Data, prompt, callback, opts)
     opts = opts or {}
-    local maxTokens = opts.maxTokens or 1500
+    local maxTokens = opts.maxTokens or 700
     local requestedModel = model
 
     -- اگر حال ہی میں اس ماڈل سے دوسرے ماڈل پر منتقلی ہوئی تھی (5 منٹ تک) تو وہی استعمال کریں
@@ -1386,6 +1453,9 @@ function callAIWithImage(apiKey, model, base64Data, prompt, callback, opts)
     -- صرف متن والی درخواست میں content سادہ سٹرنگ ہو (سرور یہی فارمیٹ سب سے محفوظ مانتا ہے)
     local contentField = contentParts
     if not base64Data then contentField = prompt end
+    if runtimeState.maxOutputCap and maxTokens > runtimeState.maxOutputCap then
+        maxTokens = runtimeState.maxOutputCap
+    end
     local payload = {
         model = modelInfo.id,
         messages = {{
@@ -1403,7 +1473,7 @@ function callAIWithImage(apiKey, model, base64Data, prompt, callback, opts)
     logInfo("Calling Groq model=" .. modelInfo.id)
 
     local function tryAttempt(attemptNumber)
-        attemptAICall(apiKey, payload, attemptNumber, model, function(result, errMsg, retryable, httpStatus, retryAfter)
+        attemptAICall(apiKey, payload, attemptNumber, model, function(result, errMsg, retryable, httpStatus, retryAfter, kind, extra)
             if result then
                 logInfo("Groq call succeeded on attempt " .. attemptNumber)
                 resetFailureState()
@@ -1422,6 +1492,16 @@ function callAIWithImage(apiKey, model, base64Data, prompt, callback, opts)
             if httpStatus == 400 and payload.reasoning_effort and string.find(string.lower(tostring(errMsg)), "reasoning", 1, true) then
                 logWarn("Model rejected reasoning_effort — retrying without it.")
                 payload.reasoning_effort = nil
+                tryAttempt(attemptNumber)
+                return
+            end
+
+            -- آؤٹ پٹ حد سے بڑا مطالبہ: سائز کم کر کے (اور آئندہ کے لیے یاد رکھ کر) ایک بار فوراً دوبارہ
+            if kind == "reduce_output" and extra and payload.max_completion_tokens and payload.max_completion_tokens > extra and not payload.__reduced then
+                logWarn("Reducing max_completion_tokens from " .. tostring(payload.max_completion_tokens) .. " to " .. tostring(extra))
+                runtimeState.maxOutputCap = extra
+                payload.max_completion_tokens = extra
+                payload.__reduced = true
                 tryAttempt(attemptNumber)
                 return
             end
@@ -1471,7 +1551,18 @@ function callAIWithImage(apiKey, model, base64Data, prompt, callback, opts)
         end)
     end
 
-    tryAttempt(1)
+    -- حد کے قریب ہوں تو ناکام ہونے کے بجائے مناسب وقت انتظار کر کے بھیجیں (لائیو فریم اپنا
+    -- انتظار خود شیڈیولر میں کرتے ہیں)
+    local estInput = (base64Data and 2400 or 0) + math.floor(#prompt / 3)
+    local wait = 0
+    if not opts.live then wait = secondsUntilBudget(estInput, maxTokens) end
+    if wait > 0 and wait <= 70 then
+        pcall(notify, "Waiting about " .. formatDuration(wait) .. " to stay inside Groq's free limit...")
+        local waitHandler = Handler(Looper.getMainLooper())
+        waitHandler.postDelayed(Runnable({ run = function() tryAttempt(1) end }), math.floor(wait * 1000))
+    else
+        tryAttempt(1)
+    end
 end
 
 -- =====================================================================
@@ -2360,7 +2451,12 @@ liveModeState = {
     lastSpokenText = nil,    -- آخری بولی گئی تفصیل (دہراؤ روکنے کے لیے)
     unchangedStreak = 0,     -- لگاتار کتنی بار منظر نہیں بدلا
     quickBusy = false,       -- Read/Detail/Label بٹن کا کام جاری ہے
-    rateLimitedUntil = 0     -- Groq کی حد (429) کی وجہ سے اس وقت تک لائیو لوپ رکا رہے گا
+    rateLimitedUntil = 0,    -- Groq کی حد (429) کی وجہ سے اس وقت تک لائیو لوپ رکا رہے گا
+    profile = nil,           -- کیمرہ اسکرین کی قسم: live / camera / find / document
+    holder = nil,            -- پریویو کا SurfaceHolder (کیمرہ بدلنے کے لیے)
+    cameraId = 0,            -- 0 = پچھلا کیمرہ، دوسرا = سامنے والا
+    cameraFront = false,
+    torchOn = false
 }
 
 -- Voice Q&A کے دوران خودکار تفصیل روک دیتا ہے تاکہ مائیک خود فون کی آواز نہ
@@ -2387,6 +2483,12 @@ function stopLiveMode()
     liveModeState.unchangedStreak = 0
     liveModeState.quickBusy = false
     liveModeState.rateLimitedUntil = 0
+    liveModeState.profile = nil
+    liveModeState.holder = nil
+    liveModeState.cameraId = 0
+    liveModeState.cameraFront = false
+    liveModeState.cameraRotation = nil
+    liveModeState.torchOn = false
     logInfo("Live Mode stopped.")
 end
 
@@ -2397,8 +2499,9 @@ local function getCameraRotation()
     local rot = 90
     pcall(function()
         local info = Camera.CameraInfo()
-        Camera.getCameraInfo(0, info)
+        Camera.getCameraInfo(liveModeState.cameraId or 0, info)
         rot = tonumber(info.orientation) or 90
+        liveModeState.cameraFront = (tonumber(info.facing) == 1)
     end)
     liveModeState.cameraRotation = rot
     return rot
@@ -2513,7 +2616,10 @@ function processLiveFrame(base64Data, statusTv, onFinished)
     local lang = getSelectedLanguage()
     local custom = getCustomPrompt("live")
     local basePrompt
-    if custom ~= "" then
+    local profile = liveModeState.profile or {}
+    if profile.kind == "find" and profile.target and profile.target ~= "" then
+        basePrompt = "The user is blind and is looking for: \"" .. profile.target .. "\". Look at the image and reply in exactly ONE short sentence (max 15 words). If you can see it, say where it is (left, right, centre, above or below), roughly how far away in steps, and what the user should do (for example turn slightly left, or walk forward). If you cannot see it, say briefly that it is not visible and suggest turning slowly."
+    elseif custom ~= "" then
         basePrompt = custom
     else
         basePrompt = "Reply in exactly ONE short, natural, spoken-style sentence (max 12 words). Describe anything important directly ahead for a visually impaired person walking: people, obstacles, stairs, vehicles, doors, or hazards. If something notable is present, include a rough approximate distance (e.g. 'a few steps ahead', 'right in front of you', 'about 2 meters away') based on visual perspective — this is only an estimate, not exact. If the path is clear, say so."
@@ -2561,7 +2667,7 @@ function processLiveFrame(base64Data, statusTv, onFinished)
             end
         end
         finish()
-    end, { maxTokens = 120, noCache = true, silentErrors = true })
+    end, { maxTokens = 120, noCache = true, silentErrors = true, live = true })
 end
 
 -- =====================================================================
@@ -2623,7 +2729,7 @@ function askAIFollowUp(question, statusTv)
                 notify("جواب نہیں مل سکا: " .. tostring(err))
                 pauseLiveAuto(0)
             end
-        end, { maxTokens = 700, noCache = true })
+        end, { maxTokens = 400, noCache = true })
     end)
 end
 
@@ -2856,16 +2962,284 @@ function liveQuickAction(kind, statusTv)
                 if statusTv then pcall(function() statusTv.setText("⚠️ " .. tostring(err)) end) end
                 notify("Could not complete the request: " .. tostring(err))
             end
-        end, { maxTokens = 1100, noCache = true })
+        end, { maxTokens = 600, noCache = true })
     end)
 end
 
-function startLiveMode()
-    if liveModeState.active then
-        notify("Live Mode پہلے سے چل رہا ہے")
+-- کیمرہ پیرامیٹرز (چھوٹا پریویو، مسلسل فوکس) سیٹ کر کے منتخب کیمرہ کھولتا ہے
+function openLiveCamera(holder)
+    local id = liveModeState.cameraId or 0
+    local cam = nil
+    local ok = pcall(function() cam = Camera.open(id) end)
+    if not ok or not cam then
+        if id ~= 0 then
+            liveModeState.cameraId = 0
+            cam = Camera.open(0)
+        else
+            error("The camera could not be opened")
+        end
+    end
+    liveModeState.camera = cam
+    liveModeState.cameraRotation = nil
+
+    -- فریم چھوٹے (≤640x480) رکھیں (کم ٹوکن خرچ ہوتے ہیں) تاکہ اپلوڈ اور جواب تیز ہو، اور
+    -- مسلسل فوکس لگائیں تاکہ تصویر دھندلی نہ آئے
+    pcall(function()
+        local params = cam.getParameters()
+        local sizes = params.getSupportedPreviewSizes()
+        local bestW, bestH, bestArea = nil, nil, 0
+        for i = 0, sizes.size() - 1 do
+            local sz = sizes.get(i)
+            local w, h = sz.width, sz.height
+            if w <= 640 and h <= 480 and (w * h) > bestArea then
+                bestW, bestH, bestArea = w, h, w * h
+            end
+        end
+        if bestW then params.setPreviewSize(bestW, bestH) end
+        pcall(function()
+            local modes = params.getSupportedFocusModes()
+            if modes and modes.contains("continuous-picture") then
+                params.setFocusMode("continuous-picture")
+            end
+        end)
+        cam.setParameters(params)
+    end)
+
+    pcall(function()
+        local rot = getCameraRotation()
+        local display = rot
+        if liveModeState.cameraFront then display = (360 - rot) % 360 end
+        cam.setDisplayOrientation(display)
+    end)
+    cam.setPreviewDisplay(holder)
+    cam.startPreview()
+    if liveModeState.torchOn then pcall(function() setLiveTorch(true) end) end
+end
+
+function setLiveTorch(on)
+    local cam = liveModeState.camera
+    if not cam then return false end
+    return pcall(function()
+        local params = cam.getParameters()
+        params.setFlashMode(on and "torch" or "off")
+        cam.setParameters(params)
+    end)
+end
+
+function toggleLiveTorch(btn)
+    local supported = false
+    pcall(function()
+        local modes = liveModeState.camera.getParameters().getSupportedFlashModes()
+        supported = (modes ~= nil and modes.contains("torch"))
+    end)
+    if not supported then
+        notify("This camera does not have a flashlight.")
         return
     end
-    if mainDlg then mainDlg.dismiss() mainDlg = nil end
+    local want = not liveModeState.torchOn
+    if setLiveTorch(want) then
+        liveModeState.torchOn = want
+        btn.setText(want and "🔦 Flash: ON" or "🔦 Flash: OFF")
+        notify(want and "Flashlight on" or "Flashlight off")
+    else
+        notify("Could not change the flashlight.")
+    end
+end
+
+function switchLiveCamera()
+    if not (liveModeState.active and liveModeState.holder) then return end
+    local count = 1
+    pcall(function() count = tonumber(Camera.getNumberOfCameras()) or 1 end)
+    if count < 2 then
+        notify("This phone has only one camera.")
+        return
+    end
+    local newId = 0
+    if (liveModeState.cameraId or 0) == 0 then
+        local frontId = nil
+        pcall(function()
+            for i = 0, count - 1 do
+                local info = Camera.CameraInfo()
+                Camera.getCameraInfo(i, info)
+                if tonumber(info.facing) == 1 then
+                    frontId = i
+                    break
+                end
+            end
+        end)
+        if not frontId then
+            notify("No front camera was found.")
+            return
+        end
+        newId = frontId
+    end
+    liveModeState.busy = true
+    pcall(function()
+        liveModeState.camera.setPreviewCallback(nil)
+        liveModeState.camera.stopPreview()
+        liveModeState.camera.release()
+    end)
+    liveModeState.camera = nil
+    liveModeState.cameraId = newId
+    local ok, err = pcall(openLiveCamera, liveModeState.holder)
+    liveModeState.busy = false
+    if ok then
+        notify(newId == 0 and "Back camera" or "Front camera")
+    else
+        pcall(reportError, "Switching camera", tostring(err))
+    end
+end
+
+-- Camera Mode: ایک تصویر کھینچ کر منتخب موڈ (یا Medicine Reader) سے پہچانتا ہے
+function cameraModeCapture(statusTv)
+    if liveModeState.quickBusy then
+        notify("Please wait, the last request is still running.")
+        return
+    end
+    local apiKey = getAIApiKey()
+    if not apiKey or apiKey == "" then
+        notify("API Key missing! Set it in Settings.")
+        return
+    end
+    local valid = { ["Analyze Image"] = true, ["Extract Text Only"] = true, ["Translate Image Text"] = true, ["Summarize Document"] = true, ["Label & Medicine Reader"] = true }
+    local modeName = (liveModeState.profile and liveModeState.profile.mode) or getSelectedRecognizeOption()
+    if not valid[modeName] then modeName = "Analyze Image" end
+    local lang = getSelectedLanguage()
+    liveModeState.quickBusy = true
+    vibratePattern("processing")
+    if statusTv then pcall(function() statusTv.setText("Taking the picture and analysing it (" .. modeName .. ")...") end) end
+    captureFreshFrame(function(frame)
+        local image = frame or liveModeState.lastFrameBase64
+        if not image then
+            liveModeState.quickBusy = false
+            vibratePattern("error")
+            notify("No camera picture is available yet. Please try again in a moment.")
+            return
+        end
+        callAIWithImage(apiKey, getAIModel(), image, buildPromptForMode(modeName, lang), function(res, err)
+            liveModeState.quickBusy = false
+            if res then
+                vibratePattern("success")
+                if statusTv then pcall(function() statusTv.setText("Done. Tap Capture for another picture.") end) end
+                saveHistoryEntry(modeName .. " (camera)", res)
+                showResultDialog(modeName, res, { followUp = { image = image, mode = modeName } })
+            else
+                vibratePattern("error")
+                if statusTv then pcall(function() statusTv.setText("⚠️ " .. tostring(err)) end) end
+            end
+        end, { maxTokens = 700, noCache = true })
+    end)
+end
+
+-- Document Reader: صفحہ مکمل فریم میں آ جائے تو خودکار طور پر پڑھ دیتا ہے
+function documentReadNow(statusTv)
+    if liveModeState.quickBusy then return end
+    local apiKey = getAIApiKey()
+    if not apiKey or apiKey == "" then
+        notify("API Key missing! Set it in Settings.")
+        return
+    end
+    liveModeState.quickBusy = true
+    pauseLiveAuto(3600)      -- Scan Again دبانے تک رہنمائی رکی رہے گی
+    pcall(stopTTS)
+    vibratePattern("processing")
+    if statusTv then pcall(function() statusTv.setText("Reading the page...") end) end
+    captureFreshFrame(function(frame)
+        local image = frame or liveModeState.lastFrameBase64
+        if not image then
+            liveModeState.quickBusy = false
+            pauseLiveAuto(0)
+            notify("No camera picture is available yet.")
+            return
+        end
+        local lang = getSelectedLanguage()
+        local prompt = "Read ALL the text on this page or document exactly as written, in natural reading order, so it can be spoken aloud. Do not describe the picture and do not add commentary. If part of the page is cut off or unreadable, say so briefly at the end. If the text is not in " .. lang .. ", write the text first and then a translation into " .. lang .. " after the word 'Translation:'."
+        callAIWithImage(apiKey, getAIModel(), image, prompt, function(res, err)
+            liveModeState.quickBusy = false
+            if res then
+                vibratePattern("success")
+                if statusTv then pcall(function() statusTv.setText("Page read. Tap Scan Again for another page.") end) end
+                saveHistoryEntry("Document Reader (" .. lang .. ")", res)
+                speakInSelectedLanguage(res, true)
+                showResultDialog("Document Reader", res, { skipAutoRead = true, followUp = { image = image, mode = "Document Reader" } })
+            else
+                pauseLiveAuto(0)
+                vibratePattern("error")
+                if statusTv then pcall(function() statusTv.setText("⚠️ " .. tostring(err)) end) end
+            end
+        end, { maxTokens = 800, noCache = true })
+    end)
+end
+
+function processDocumentFrame(base64Data, statusTv, onFinished)
+    local function finish()
+        liveModeState.busy = false
+        if onFinished then pcall(onFinished) end
+    end
+    local apiKey = getAIApiKey()
+    if not apiKey or apiKey == "" then
+        if statusTv then pcall(function() statusTv.setText("API Key missing — open Settings and add your key.") end) end
+        finish()
+        return
+    end
+    liveModeState.busy = true
+    local lang = getSelectedLanguage()
+    local prompt = "You are guiding a blind person who is holding a phone camera over a document, book page or paper. Look at the image. If one whole page or document is fully inside the frame and reasonably sharp and readable, reply with exactly the single word READY. Otherwise reply with exactly 'MOVE:' followed by one short instruction in " .. lang .. " telling the person how to move the phone (for example move a little to the left, move the phone further away, hold it steadier, or switch on more light). Write nothing else."
+    callAIWithImage(apiKey, getAIModel(), base64Data, prompt, function(res, err, httpStatus, retryAfter)
+        local paused = os.time() < liveModeState.pausedUntil
+        if res then
+            liveModeState.lastError = nil
+            if not paused then
+                local upper = string.upper(res)
+                if string.find(upper, "READY", 1, true) and not string.find(upper, "MOVE", 1, true) then
+                    finish()
+                    vibratePattern("success")
+                    documentReadNow(statusTv)
+                    return
+                end
+                local hint = res:gsub("^%s*[Mm][Oo][Vv][Ee]%s*:%s*", "")
+                if statusTv then pcall(function() statusTv.setText(hint) end) end
+                local similar = liveModeState.lastSpokenText and (os.time() - (liveModeState.lastSpokeAt or 0)) < 20
+                    and textSimilarity(hint, liveModeState.lastSpokenText) >= 0.7
+                if not similar then
+                    liveModeState.lastSpokenText = hint
+                    liveModeState.lastSpokeAt = os.time()
+                    speakInSelectedLanguage(hint, true)
+                end
+            end
+        else
+            logError("Document frame error: " .. tostring(err))
+            if httpStatus == 429 then
+                local pauseSec = math.min(tonumber(retryAfter) or 30, 300) + 1
+                liveModeState.rateLimitedUntil = os.time() + pauseSec
+            end
+            if statusTv then pcall(function() statusTv.setText("⚠️ " .. tostring(err)) end) end
+            local errKey = tostring(httpStatus or err)
+            if errKey ~= liveModeState.lastError and not paused then
+                liveModeState.lastError = errKey
+                vibratePattern("error")
+                speakInSelectedLanguage(tostring(err), true)
+            end
+        end
+        finish()
+    end, { maxTokens = 60, noCache = true, silentErrors = true, live = true })
+end
+
+-- profile.kind: "live" (ڈیفالٹ) | "camera" | "find" | "document"
+function startLiveMode(profile)
+    profile = profile or { kind = "live" }
+    local kind = profile.kind or "live"
+    if liveModeState.active then
+        notify("A camera screen is already running.")
+        return
+    end
+    if mainDlg then pcall(function() mainDlg.dismiss() end) mainDlg = nil end
+    liveModeState.profile = profile
+    liveModeState.cameraId = 0
+    liveModeState.cameraFront = false
+    liveModeState.torchOn = false
+    liveModeState.lastSpokenText = nil
+    liveModeState.unchangedStreak = 0
 
     local liveLayout = LinearLayout(ctx)
     liveLayout.setOrientation(1)
@@ -2880,100 +3254,133 @@ function startLiveMode()
     statusTv.setPadding(20, 20, 20, 20)
     liveLayout.addView(statusTv)
 
-    -- Voice Q&A بٹن — دبائیں، سوال بولیں، موجودہ منظر کے مطابق جواب سنیں
-    local btnAsk = Button(ctx)
-    btnAsk.setText("🎤 ASK A QUESTION")
-    btnAsk.setBackgroundColor(0xFF4CAF50)
-    btnAsk.setTextColor(0xFFFFFFFF)
-    btnAsk.onClick = guard("onClick (line 2888)", function() askQuestionInLiveMode(statusTv) end)
-    liveLayout.addView(btnAsk)
-
-    -- فوری بٹن: متن پڑھیں / تفصیل / لیبل
-    local quickRow = LinearLayout(ctx)
-    quickRow.setOrientation(0)
-    local function addQuick(label, description, kind)
+    local liveDlg = nil
+    local function addButton(parent, label, description, handler, color, weighted)
         local b = Button(ctx)
         b.setText(label)
         b.setContentDescription(description)
-        b.setLayoutParams(LinearLayout.LayoutParams(0, -2, 1))
-        b.onClick = guard("onClick (line 2899)", function() liveQuickAction(kind, statusTv) end)
-        quickRow.addView(b)
+        if color then
+            b.setBackgroundColor(color)
+            b.setTextColor(0xFFFFFFFF)
+        end
+        if weighted then b.setLayoutParams(LinearLayout.LayoutParams(0, -2, 1)) end
+        b.onClick = guard("camera button: " .. label, handler)
+        parent.addView(b)
+        return b
     end
-    addQuick("📖 Read", "Read the text in front of the camera aloud", "read")
-    addQuick("🔍 Detail", "Describe the scene in detail", "detail")
-    addQuick("💊 Label", "Read a medicine or product label", "label")
-    liveLayout.addView(quickRow)
 
-    local liveDlg = LuaDialog(ctx)
-    liveDlg.setTitle("Live Navigation Mode — " .. getSelectedLanguage() .. " (every " .. (getLiveModeIntervalSeconds()) .. "s)")
+    local lang = getSelectedLanguage()
+    local title
+    if kind == "camera" then
+        title = "Camera Mode — " .. tostring(profile.mode or getSelectedRecognizeOption())
+        addButton(liveLayout, "📸 CAPTURE", "Take a picture and analyse it", function() cameraModeCapture(statusTv) end, 0xFF4CAF50)
+    elseif kind == "find" then
+        title = "Find Object — " .. tostring(profile.target or "")
+        addButton(liveLayout, "🎤 ASK A QUESTION", "Ask a question by voice", function() askQuestionInLiveMode(statusTv) end, 0xFF4CAF50)
+        addButton(liveLayout, "🎯 Change What I Am Looking For", "Change the object you are looking for", function()
+            stopLiveMode()
+            pcall(function() liveDlg.dismiss() end)
+            showFindObjectDialog()
+        end)
+    elseif kind == "document" then
+        title = "Document Reader"
+        addButton(liveLayout, "📸 SCAN NOW", "Read the page in front of the camera now", function() documentReadNow(statusTv) end, 0xFF4CAF50)
+        addButton(liveLayout, "🔁 SCAN AGAIN", "Start guiding again for another page", function()
+            pauseLiveAuto(0)
+            liveModeState.quickBusy = false
+            liveModeState.lastSpokenText = nil
+            pcall(function() statusTv.setText("Guiding again. Hold the phone above the page.") end)
+        end)
+    else
+        title = "Live Navigation Mode — " .. lang .. " (every " .. (getLiveModeIntervalSeconds()) .. "s)"
+        -- Voice Q&A بٹن — دبائیں، سوال بولیں، موجودہ منظر کے مطابق جواب سنیں
+        addButton(liveLayout, "🎤 ASK A QUESTION", "Ask a question by voice", function() askQuestionInLiveMode(statusTv) end, 0xFF4CAF50)
+        -- فوری بٹن: متن پڑھیں / تفصیل / لیبل
+        local quickRow = LinearLayout(ctx)
+        quickRow.setOrientation(0)
+        addButton(quickRow, "📖 Read", "Read the text in front of the camera aloud", function() liveQuickAction("read", statusTv) end, nil, true)
+        addButton(quickRow, "🔍 Detail", "Describe the scene in detail", function() liveQuickAction("detail", statusTv) end, nil, true)
+        addButton(quickRow, "💊 Label", "Read a medicine or product label", function() liveQuickAction("label", statusTv) end, nil, true)
+        liveLayout.addView(quickRow)
+    end
+
+    -- ہر کیمرہ اسکرین پر: فلیش اور کیمرہ بدلنے کے بٹن
+    local toolsRow = LinearLayout(ctx)
+    toolsRow.setOrientation(0)
+    local flashBtn = nil
+    flashBtn = addButton(toolsRow, "🔦 Flash: OFF", "Flashlight on or off", function() toggleLiveTorch(flashBtn) end, nil, true)
+    addButton(toolsRow, "🔄 Camera", "Switch between the back and front camera", function() switchLiveCamera() end, nil, true)
+    liveLayout.addView(toolsRow)
+
+    liveDlg = LuaDialog(ctx)
+    liveDlg.setTitle(title)
     local liveScroll = ScrollView(ctx)
     liveScroll.setFillViewport(true)
     liveScroll.addView(liveLayout)
     pcall(applyAccessibilityLabels, liveScroll)
     liveDlg.setView(liveScroll)
     liveDlg.setCancelable(false)
-    liveDlg.setNegativeButton("Stop", guard("NegativeButton (line 2915)", function()
+    liveDlg.setNegativeButton("Stop", guard("NegativeButton (camera stop)", function()
         stopLiveMode()
-        notify("Live Mode بند کر دیا گیا")
+        notify("Camera screen closed")
         createMainUI()
     end))
     liveDlg.show()
 
+    local startTexts = {
+        live = "Live Mode active — the first description is coming...",
+        camera = "Point the camera at what you want to know about, then tap Capture.",
+        find = "Looking for: " .. tostring(profile.target or "") .. ". Turn slowly.",
+        document = "Hold the phone above the page. I will guide you and read it when the whole page is in view."
+    }
+
     local holder = surfaceView.getHolder()
     holder.addCallback(SurfaceHolder.Callback{
-        surfaceCreated = guard("surfaceCreated (line 2924)", function(h)
+        surfaceCreated = guard("surfaceCreated (camera)", function(h)
             local ok, err = pcall(function()
-                liveModeState.camera = Camera.open()
-
-                -- فریم چھوٹے (≤640x480) رکھیں (کم ٹوکن خرچ ہوتے ہیں) تاکہ اپلوڈ اور جواب تیز ہو، اور
-                -- مسلسل فوکس لگائیں تاکہ تصویر دھندلی نہ آئے
-                pcall(function()
-                    local cam = liveModeState.camera
-                    local params = cam.getParameters()
-                    local sizes = params.getSupportedPreviewSizes()
-                    local bestW, bestH, bestArea = nil, nil, 0
-                    for i = 0, sizes.size() - 1 do
-                        local sz = sizes.get(i)
-                        local w, h = sz.width, sz.height
-                        if w <= 640 and h <= 480 and (w * h) > bestArea then
-                            bestW, bestH, bestArea = w, h, w * h
-                        end
-                    end
-                    if bestW then params.setPreviewSize(bestW, bestH) end
-                    pcall(function()
-                        local modes = params.getSupportedFocusModes()
-                        if modes and modes.contains("continuous-picture") then
-                            params.setFocusMode("continuous-picture")
-                        end
-                    end)
-                    cam.setParameters(params)
-                end)
-                pcall(function() liveModeState.camera.setDisplayOrientation(getCameraRotation()) end)
-
-                liveModeState.camera.setPreviewDisplay(h)
-                liveModeState.camera.startPreview()
+                liveModeState.holder = h
+                openLiveCamera(h)
                 liveModeState.active = true
                 liveModeState.busy = false
                 liveModeState.pausedUntil = 0
                 liveModeState.rateLimitedUntil = 0
-                statusTv.setText("Live Mode active — جلد پہلی تفصیل آ رہی ہے...")
-                logInfo("Live Mode camera started.")
+                statusTv.setText(startTexts[kind] or startTexts.live)
+                logInfo("Camera screen started: " .. kind)
+                if kind == "document" then pcall(notify, "Document Reader. Hold the phone above the page.") end
+                if kind == "find" then pcall(notify, "Looking for " .. tostring(profile.target or "") .. ". Turn slowly.") end
 
-                -- پہلا کیپچر 1.2 سیکنڈ بعد؛ اس کے بعد ہر جواب مکمل ہونے کے "وقفے" بعد
-                -- اگلا (پہلے ہر وقفے پر ایک ساتھ کیپچر ہوتا تھا اور پہلا جواب بہت دیر سے آتا تھا)
+                -- Camera Mode میں خودکار لوپ نہیں؛ صرف Capture بٹن سے تصویر لی جاتی ہے
+                if kind == "camera" then return end
+
+                local frameHandler = processLiveFrame
+                if kind == "document" then frameHandler = processDocumentFrame end
+
+                -- پہلا کیپچر 1.2 سیکنڈ بعد؛ اس کے بعد ہر جواب مکمل ہونے کے "وقفے" بعد اگلا
                 local loopHandler = Handler(Looper.getMainLooper())
                 local function scheduleNextCapture(delayMs)
                     if not liveModeState.active then return end
-                    loopHandler.postDelayed(Runnable({ run = guard("run (line 2967)", function()
+                    loopHandler.postDelayed(Runnable({ run = guard("run (camera loop)", function()
                         if not liveModeState.active or not liveModeState.camera then return end
                         if liveModeState.busy or os.time() < liveModeState.pausedUntil or os.time() < (liveModeState.rateLimitedUntil or 0) then
                             scheduleNextCapture(1000)
                             return
                         end
+                        -- Groq کی مفت حد کے اندر رہنے کے لیے ضرورت ہو تو انتظار (ہر تصویر ~2200 ان پُٹ ٹوکن)
+                        local lastIn = 0
+                        pcall(function()
+                            local w = runtimeState.tokenWindow
+                            if w and #w > 0 then lastIn = w[#w].input or 0 end
+                        end)
+                        local budgetWait = secondsUntilBudget(math.max(2400, lastIn), 150)
+                        if budgetWait > 0 then
+                            pcall(function() statusTv.setText("Waiting about " .. formatDuration(budgetWait) .. " to stay inside Groq's free limit...") end)
+                            scheduleNextCapture(math.floor(budgetWait * 1000))
+                            return
+                        end
                         liveModeState.busy = true
                         captureFreshFrame(function(b64)
                             if b64 and liveModeState.active then
-                                processLiveFrame(b64, statusTv, function()
+                                frameHandler(b64, statusTv, function()
                                     -- منظر نہ بدلے تو چیک کا وقفہ بڑھتا ہے (زیادہ سے زیادہ 3 گنا): کم درخواستیں، کم 429
                                     local streak = math.min(liveModeState.unchangedStreak or 0, 2)
                                     scheduleNextCapture(getLiveModeIntervalSeconds() * 1000 * (1 + streak))
@@ -2988,10 +3395,10 @@ function startLiveMode()
                 scheduleNextCapture(1200)
             end)
             if not ok then
-                logError("Live Mode camera failed to start: " .. tostring(err))
-                pcall(reportError, "Live Mode camera", tostring(err))
-                statusTv.setText("Camera دستیاب نہیں۔ App Settings میں جا کر Camera permission دیں اور دوبارہ کوشش کریں۔")
-                notify("Camera access failed. براہ کرم App Settings میں Camera permission چیک کریں۔")
+                logError("Camera screen failed to start: " .. tostring(err))
+                pcall(reportError, "Camera screen (" .. kind .. ")", tostring(err))
+                statusTv.setText("The camera is not available. Check the Camera permission in App Settings and try again.")
+                notify("Camera access failed. Please check the Camera permission in App Settings.")
             end
         end),
         surfaceChanged = function(h, format, w, hgt) end,
@@ -3034,6 +3441,36 @@ end
 
 -- opts.skipAutoRead: خودکار پڑھنا نہ کریں (مثلاً ہسٹری سے دوبارہ کھولتے وقت)
 -- opts.followUp = { image = base64, mode = "..." }: "Ask a Follow-up" بٹن دکھائیں
+-- لمبے متن کو حصوں (Parts) میں بانٹتا ہے؛ پیراگراف کے بیچ سے نہیں (اور UTF-8 حرف کے بیچ سے کبھی نہیں)
+function splitIntoParts(text, maxBytes)
+    text = tostring(text or "")
+    if #text <= maxBytes then return { text } end
+    local parts, current = {}, ""
+    for para in (text .. "\n"):gmatch("(.-)\n") do
+        while #para > maxBytes do
+            local piece = safeUtf8Cut(para, maxBytes)
+            if #piece == 0 then break end
+            if #current > 0 then
+                table.insert(parts, current)
+                current = ""
+            end
+            table.insert(parts, piece)
+            para = para:sub(#piece + 1)
+        end
+        if #current > 0 and #current + #para + 1 > maxBytes then
+            table.insert(parts, current)
+            current = para
+        elseif #current > 0 then
+            current = current .. "\n" .. para
+        else
+            current = para
+        end
+    end
+    if #current > 0 then table.insert(parts, current) end
+    if #parts == 0 then parts = { text } end
+    return parts
+end
+
 function showResultDialog(title, content, opts)
     opts = opts or {}
     local resultDlg = LuaDialog(ctx)
@@ -3044,10 +3481,27 @@ function showResultDialog(title, content, opts)
     inner.setOrientation(1)
     inner.setPadding(30, 20, 30, 20)
 
+    local parts = splitIntoParts(content, 3500)
+    local currentPart = 1
+    local partLabel = nil
+    local textView = nil
+    local btnPrev, btnNext = nil, nil
+
     local btnRead = Button(ctx)
-    btnRead.setText("🔊 Read Aloud")
-    btnRead.onClick = guard("onClick (line 3049)", function() speakInSelectedLanguage(content, true) end)
+    if #parts > 1 then
+        btnRead.setText("🔊 Read This Part")
+        btnRead.onClick = guard("read part", function() speakInSelectedLanguage(parts[currentPart], true) end)
+    else
+        btnRead.setText("🔊 Read Aloud")
+        btnRead.onClick = guard("read aloud", function() speakInSelectedLanguage(content, true) end)
+    end
     inner.addView(btnRead)
+    if #parts > 1 then
+        local btnReadAll = Button(ctx)
+        btnReadAll.setText("📚 Read All")
+        btnReadAll.onClick = guard("read all", function() speakInSelectedLanguage(content, true) end)
+        inner.addView(btnReadAll)
+    end
 
     if opts.followUp and opts.followUp.image then
         local btnFollow = Button(ctx)
@@ -3071,12 +3525,47 @@ function showResultDialog(title, content, opts)
         inner.addView(btnSummarize)
     end
 
-    local textView = TextView(ctx)
-    textView.setText(content)
+    if #parts > 1 then
+        partLabel = TextView(ctx)
+        partLabel.setTextSize(13)
+        partLabel.setPadding(0, 15, 0, 0)
+        inner.addView(partLabel)
+
+        local navRow = LinearLayout(ctx)
+        navRow.setOrientation(0)
+        btnPrev = Button(ctx)
+        btnPrev.setText("⏮ Previous")
+        btnPrev.setLayoutParams(LinearLayout.LayoutParams(0, -2, 1))
+        navRow.addView(btnPrev)
+        btnNext = Button(ctx)
+        btnNext.setText("⏭ Next")
+        btnNext.setLayoutParams(LinearLayout.LayoutParams(0, -2, 1))
+        navRow.addView(btnNext)
+        inner.addView(navRow)
+    end
+
+    textView = TextView(ctx)
+    textView.setText(parts[1])
     textView.setTextSize(14)
     textView.setPadding(0, 20, 0, 20)
     textView.setTextColor(0xFF000000)
     inner.addView(textView)
+
+    if #parts > 1 then
+        local function showPart(i, announce)
+            if i < 1 then i = 1 end
+            if i > #parts then i = #parts end
+            currentPart = i
+            textView.setText(parts[i])
+            local label = "Part " .. i .. " of " .. #parts
+            partLabel.setText(label)
+            pcall(function() partLabel.setContentDescription(label) end)
+            if announce then notify(label) end
+        end
+        showPart(1, false)
+        btnPrev.onClick = guard("previous part", function() showPart(currentPart - 1, true) end)
+        btnNext.onClick = guard("next part", function() showPart(currentPart + 1, true) end)
+    end
     scrollView.addView(inner)
     pcall(applyAccessibilityLabels, scrollView)
     resultDlg.setView(scrollView)
@@ -3139,7 +3628,7 @@ function showFollowUpDialog(imageB64, previousAnswer, mode)
                 vibratePattern("error")
                 notify("Error: " .. tostring(err))
             end
-        end, { maxTokens = 900, noCache = true })
+        end, { maxTokens = 500, noCache = true })
     end
 
     local dlg = LuaDialog(ctx)
@@ -3285,6 +3774,20 @@ function showAISettingsDialog()
     settingsLayout.addView(intervalSpinner)
     pcall(function() intervalSpinner.setContentDescription("Live Mode interval") end)
 
+    -- Default Mode: ایپ کھلتے ہی سیدھا یہ فیچر کھلے (None = عام مین مینو)
+    local defaultModeLabel = TextView(ctx)
+    defaultModeLabel.setText("Default Mode (opens straight away when the app starts):")
+    defaultModeLabel.setPadding(0, 20, 0, 0)
+    settingsLayout.addView(defaultModeLabel)
+    local defaultModeSpinner = Spinner(ctx)
+    defaultModeSpinner.setAdapter(ArrayAdapter(ctx, android.R.layout.simple_spinner_item, DEFAULT_MODE_OPTIONS))
+    local savedDefaultMode = getDefaultMode()
+    for i = 1, #DEFAULT_MODE_OPTIONS do
+        if DEFAULT_MODE_OPTIONS[i] == savedDefaultMode then defaultModeSpinner.setSelection(i - 1) break end
+    end
+    settingsLayout.addView(defaultModeSpinner)
+    pcall(function() defaultModeSpinner.setContentDescription("Default mode that opens when the app starts") end)
+
     -- بولنے کی رفتار
     local rateLabel = TextView(ctx)
     rateLabel.setText("Speech Rate:")
@@ -3415,6 +3918,7 @@ function showAISettingsDialog()
         resetFailureState()
         saveAIModel(AI_MODELS[modelSpinner.getSelectedItemPosition() + 1])
         saveLiveModeIntervalSeconds(INTERVAL_OPTIONS[intervalSpinner.getSelectedItemPosition() + 1])
+        saveDefaultMode(DEFAULT_MODE_OPTIONS[defaultModeSpinner.getSelectedItemPosition() + 1])
         saveSpeechRate(RATE_OPTIONS[rateSpinner.getSelectedItemPosition() + 1])
         saveSpeechPitch(PITCH_OPTIONS[pitchSpinner.getSelectedItemPosition() + 1])
         notify("Settings saved")
@@ -3829,45 +4333,30 @@ end
 -- ہر نئی چیز WHATS_NEW میں اور ہر بگ فکس BUG_FIXES میں ایک نئی لائن (انگریزی
 -- میں) کے طور پر اضافہ کریں — About اسکرین خود بخود انہیں دکھا دے گی۔
 -- =====================================================================
-local APP_VERSION = "2.1"
+local APP_VERSION = "2.2"
 
 -- نئے فیچرز اور تبدیلیاں (انگریزی میں)
 local WHATS_NEW = {
-    "AI engine changed to Groq. Image analysis, Batch Processing, Live Navigation Mode and Voice Q&A now all run on Groq's Qwen 3.8 27B vision model. Groq has a free plan with usage limits.",
-    "New API key setup: Settings now has \"Create API Key\" (opens console.groq.com/keys) and \"Test API Key\". Keys from Gemini or xAI will not work; a Groq key starts with gsk_.",
-    "New 7th image mode, Label & Medicine Reader: point the camera at a medicine strip, box or product label and it reads the name, strength and dosage, expiry date, batch number and warnings exactly as printed. It never guesses, tells you when something is unreadable, and reminds you to confirm medicine doses with a doctor or pharmacist.",
-    "Faster Live Mode: smaller camera frames, upright (rotated) pictures for better accuracy, the first description arrives within about 1-2 seconds, and the next picture is taken shortly after each answer. The default gap is now 3 seconds.",
-    "Live Mode quick buttons: Read (reads the text in front of the camera), Detail (a longer description) and Label (reads medicine and product labels).",
-    "Live Mode now speaks only when the scene changes, and checks less often while nothing changes, which also saves your Groq free limit. It repeats itself after about 40 seconds as reassurance. This can be turned off in Settings.",
-    "Live Mode now handles Groq's usage limits properly: it reads the wait time Groq gives, pauses by itself, shows and speaks a clear message (per-minute or daily limit), and carries on automatically afterwards.",
-    "New Diagnostics screen: one tap checks your API key, model, internet, a live test of the Groq service, camera, microphone and storage permissions, voice input, and speech output (including the voice for your selected language), and marks each with a tick, a warning or a cross. You can copy the report.",
-    "New Voice Message to Text: turn a WhatsApp voice message, or any audio file, into text using Groq's Whisper speech recognition. Choose the language spoken in the message, pick it from a list of your newest voice notes, and then read it, listen to it, copy it, share it, translate it or summarize it. Audio files up to 25 MB (Groq's free limit) are accepted, and you are asked to confirm before uploading a large file.",
-    "New error dialog: whenever something goes wrong, a window now opens with exactly where it happened and what the error was, with Copy and Copy All buttons so you can send it. More > Error Log also shows the saved errors and warnings, with Copy and Clear Log.",
-    "New More button on the main screen: Help / Tutorial, Diagnostics, Permissions Status, History and About & Support now live inside it, which makes the main screen shorter and easier to use with a screen reader.",
-    "Every result now has a Read Aloud button, and Settings has an Auto-Read Results option.",
-    "Follow-up questions: after an image analysis you can ask more questions about the same image, by voice or by typing.",
-    "TalkBack support: buttons with emoji now have clean spoken names, the main dropdowns have labels, and speech output no longer reads markdown symbols such as stars and hashes.",
-    "Token budget warnings: you are warned when you reach 80 percent and 100 percent of your monthly budget.",
-    "Privacy toggle: Settings now lets you turn off saving of history and cached answers.",
-    "The Help / Tutorial text is now in English, mentions the Label & Medicine Reader mode and explains the new More menu.",
-    "Support links updated: International Stadium by Bridge Tech, WhatsApp Group, YouTube Channel and WhatsApp Channel.",
-    "Removed the Barcode/QR Scanner, Currency Note Detector and Color Detector modes because they did not work."
+    "New Smart Tools button on the main screen with seven tools: Camera Mode (take a picture and have it analysed in the mode you chose), Medicine Reader (camera), Document Reader, Find Object, Light Detector, Screen Translator and Describe Current Screen.",
+    "Document Reader: hold the camera over a page or book and it guides you by voice (move left, move further away, hold steady) until the whole page is in view, then it reads the page aloud automatically.",
+    "Find Object: say or type what you are looking for (for example my keys or the door) and the camera keeps telling you whether it can see it, where it is and how far.",
+    "Light Detector: tells you whether the room is dark or lit using the phone's light sensor, in the language you selected.",
+    "Screen Translator: translates the text on the screen you are looking at into your language. Describe Current Screen explains what is on the screen and what the buttons do.",
+    "Flash and camera switch: every camera screen, including Live Mode, now has a Flash button and a button to switch between the back and front camera.",
+    "Long results are now split into parts with Previous and Next buttons, plus Read This Part and Read All.",
+    "Default Mode: in Settings you can choose which feature opens straight away when the app starts. Every such screen has a way back to the main menu.",
+    "New error dialog: whenever something goes wrong, a window opens with exactly where it happened and what the error was, with Copy and Copy All buttons so you can send it. More > Error Log also shows the saved errors and warnings, with Copy and Clear Log.",
+    "Smart pacing for Groq's free limits: the app learns your account's real per-minute limits from Groq's own messages and waits before sending instead of failing. On the free plan each picture costs about 2,200 of the 7,000 input tokens allowed per minute, so Live Mode and the guidance screens can send about 3 pictures a minute; they space them out by themselves and show how long they are waiting.",
+    "Voice messages and audio files up to 25 MB (Groq's free limit) are accepted, and you are asked to confirm before uploading a large file."
 }
 
 -- درست کیے گئے بگز (انگریزی میں)
 local BUG_FIXES = {
-    "Share: tapping Share in a result, in History or in Backup now closes all of the app's windows before the share sheet opens. Before, the app stayed open behind it.",
-    "Live Mode errors 400 and 404: after a short time Live Mode could stop with these errors. The cause was a backup model, Qwen 3.6 27B, which Groq shut down on 14 September 2026. It has been removed, so the app no longer switches to a model that no longer exists.",
-    "Live Mode stopping after a little use: Groq's free plan has per-minute and daily limits. The app now waits and explains instead of failing, and uses smaller pictures and shorter replies to stay within the limits for longer.",
-    "Live Mode errors (wrong key, rate limit, network problems) are now shown on screen and spoken once, instead of failing silently.",
-    "Voice Q&A: Live Mode pauses its own commentary while you speak, so the microphone no longer hears the phone's voice and your answer is no longer cut off. It also takes a fresh camera picture when you ask, still answers general questions when no picture is available, and listens again once if it hears nothing.",
-    "Safe Mode: it now clears itself after about a minute (it used to block the AI until the app was restarted) and no longer triggers for wrong-key or wrong-model mistakes.",
-    "Shake-to-Activate could never open Live Mode because of a coding mistake. It now works when switched on in Settings.",
-    "Clearer error messages for a wrong key, an unavailable model, a request that is too large, rate limits and network problems.",
-    "Summarize and Translate on a voice message could show an error. Text-only requests are now sent in the simpler format the server expects, long transcripts are now cut safely (cutting in the middle of an Urdu letter could break the request), and any error that remains now appears in the new error dialog.",
-    "Voice messages and audio files between 12 MB and 25 MB were refused with a message that the file was not supported. Groq accepts up to 25 MB on the free plan, so those files are now accepted.",
+    "Summarize, Translate and long answers could fail on Groq's free plan: the app asked for up to 1,500 answer tokens, but the free plan allows only 1,000 output tokens per minute, so Groq refused the request (\"Request too large\"). Answers now ask for smaller sizes, the app shrinks a request by itself if Groq says it is too large, and it waits instead of failing when the limit is nearly used up.",
+    "Summarize and Translate on a voice message could show an error. Text-only requests are now sent in the simpler format the server expects, and long transcripts are cut safely (cutting in the middle of an Urdu letter could break the request).",
+    "Voice messages and audio files between 12 MB and 25 MB were refused with a message that the file was not supported. They are now accepted.",
     "Errors inside buttons and windows used to disappear silently. They are now caught and shown in the error dialog.",
-    "Settings toggle buttons (Auto-Read Results, Speak Only When Scene Changes, Save History and Cache) crashed with a \"toString\" error when tapped. They now switch and announce their new state correctly."
+    "The error dialog no longer repeats itself for the same problem when only a number in the message (such as a waiting time) changes."
 }
 
 -- =====================================================================
@@ -3949,7 +4438,7 @@ function reportError(source, message, details)
         logError("[" .. tostring(source) .. "] " .. msg .. ((details and details ~= "") and (" | " .. tostring(details)) or ""))
     end)
     -- ایک جیسا ایرر 20 سیکنڈ کے اندر بار بار ڈائیلاگ نہ دکھائے
-    local key = tostring(source) .. "|" .. string.sub(msg, 1, 60)
+    local key = tostring(source) .. "|" .. string.sub((msg:gsub("%d+", "#")), 1, 60)
     local now = os.time()
     if errorLastShown[key] and now - errorLastShown[key] < 20 then return end
     errorLastShown[key] = now
@@ -4017,7 +4506,7 @@ end
 
 local function buildAboutText()
     local lines = {}
-    table.insert(lines, "CSR AI Vision Assistant is an Android accessibility tool that uses Groq AI to help visually impaired users understand the world around them. It can describe photos, read text and documents, translate text, read medicine and product labels, and guide you through a live camera view while answering your spoken questions.")
+    table.insert(lines, "CSR AI Vision Assistant is an Android accessibility tool that uses Groq AI to help visually impaired users understand the world around them. It can describe photos, read text and documents, translate text, read medicine and product labels, guide you through a live camera view while answering your spoken questions, help you find objects, read documents with camera guidance, tell you whether a room is lit, translate or describe the current screen, and turn voice messages into text.")
     table.insert(lines, "")
     table.insert(lines, "WHAT'S NEW IN VERSION " .. APP_VERSION)
     for _, item in ipairs(WHATS_NEW) do
@@ -4305,14 +4794,23 @@ function getTutorialText()
         "2. Tap \"BATCH PROCESS\" to select several photos at once and process them together.\n\n" ..
         "3. Tap \"VOICE MESSAGE TO TEXT\" to turn a WhatsApp voice message, or any audio file, into text. Choose the language spoken in it, then pick the message from the list. You can then read it, listen to it, copy it, share it, translate it or summarize it.\n\n" ..
         "4. Tap \"START LIVE MODE\" and the camera will keep describing what is in front of you every few seconds. Inside Live Mode, tap \"ASK A QUESTION\" and speak to ask the AI anything you like, or use the Read, Detail and Label buttons for quick answers.\n\n" ..
-        "5. \"Settings\" is where you set your API key, AI model, language, speech voice and other options.\n\n" ..
-        "6. \"More\" opens the extra tools:\n" ..
+        "5. \"SMART TOOLS\" opens more tools:\n" ..
+        "• Camera Mode takes a picture and analyses it in the mode you selected.\n" ..
+        "• Medicine Reader (Camera) reads a medicine strip or box.\n" ..
+        "• Document Reader guides you by voice until the whole page is in view, then reads it.\n" ..
+        "• Find Object tells you where the thing you are looking for is.\n" ..
+        "• Light Detector tells you whether the room is dark or lit.\n" ..
+        "• Screen Translator translates the text on the screen you are looking at, and Describe Current Screen explains what is on it.\n" ..
+        "Every camera screen has a Flash button and a button to switch between the back and front camera.\n\n" ..
+        "6. \"Settings\" is where you set your API key, AI model, language, speech voice, the Default Mode that opens when the app starts, and other options.\n\n" ..
+        "7. \"More\" opens the extra tools:\n" ..
         "• History keeps your earlier results so you can read or listen to them again.\n" ..
         "• Diagnostics checks your API key, internet, permissions and voice in one tap and shows what is wrong.\n" ..
         "• Permissions Status shows whether the Camera, Microphone and Storage permissions are turned on.\n" ..
         "• Error Log shows saved errors and warnings, which you can copy and send.\n" ..
         "• Help / Tutorial plays these instructions again.\n" ..
         "• About & Support shows what is new, the bug fixes and the support links.\n\n" ..
+        "Long results are split into parts: use Next and Previous, Read This Part, or Read All.\n\n" ..
         "To hear these instructions again at any time, tap \"More\" and then \"Help / Tutorial\"."
 end
 
@@ -4843,7 +5341,7 @@ function runTextAction(kind, text)
             vibratePattern("error")
             notify("Error: " .. tostring(err))
         end
-    end, { maxTokens = 900, noCache = true })
+    end, { maxTokens = 500, noCache = true })
 end
 
 -- فائلوں کی فہرست دکھاتا ہے؛ کسی پر ٹیپ کرنے سے ٹرانسکرپشن شروع
@@ -4977,7 +5475,261 @@ function showVoiceToTextDialog()
     pcall(applyAccessibilityLabels, scroll)
     dlg.setView(scroll)
     dlg.setPositiveButton("Close", nil)
+    dlg.setNegativeButton("Main Menu", guard("voice dialog main menu", function() createMainUI() end))
     dlg.show()
+end
+
+-- =====================================================================
+-- SMART TOOLS (2.2) — Light Detector، Find Object، Screen Translator /
+-- Describe Current Screen، اور ڈیفالٹ موڈ
+-- =====================================================================
+
+-- روشنی کا حساس (light sensor) پڑھ کر بتاتا ہے کہ کمرہ اندھیرا ہے یا روشن
+function runLightDetector(thenShowMain)
+    local function finished()
+        if thenShowMain then createMainUI() end
+    end
+    local ok, err = pcall(function()
+        local sm = ctx.getSystemService(Context.SENSOR_SERVICE)
+        local sensor = sm.getDefaultSensor(Sensor.TYPE_LIGHT)
+        if not sensor then
+            vibratePattern("error")
+            notify("This phone has no light sensor.")
+            finished()
+            return
+        end
+        local got = false
+        local listener = nil
+
+        local function announce(lux)
+            local text
+            if lux < 5 then text = "It is completely dark."
+            elseif lux < 30 then text = "It is very dim. The lights are probably off."
+            elseif lux < 150 then text = "It is dim, like a room with weak light."
+            elseif lux < 1000 then text = "The room is lit. The lights seem to be on."
+            elseif lux < 10000 then text = "It is bright."
+            else text = "It is very bright, probably direct sunlight." end
+            text = text .. " About " .. math.floor(lux) .. " lux."
+            vibratePattern("success")
+            local lang = getSelectedLanguage()
+            local apiKey = getAIApiKey()
+            if lang == "English" or not apiKey or apiKey == "" then
+                speakInSelectedLanguage(text)
+                finished()
+            else
+                -- دوسری زبانوں میں یہی جملہ AI سے ترجمہ کروا کر بولتے ہیں (ناکام ہو تو انگریزی)
+                callAIWithImage(apiKey, getAIModel(), nil, "Say the following as one short, natural spoken sentence in " .. lang .. ". Output only the sentence: " .. text, function(res, err2)
+                    speakInSelectedLanguage(res or text)
+                    finished()
+                end, { maxTokens = 80, noCache = true, silentErrors = true })
+            end
+        end
+
+        listener = SensorEventListener{
+            onSensorChanged = guard("light sensor", function(event)
+                if got then return end
+                got = true
+                pcall(function() sm.unregisterListener(listener) end)
+                announce(tonumber(getArrVal(event.values, 0)) or 0)
+            end),
+            onAccuracyChanged = function(s, a) end
+        }
+        sm.registerListener(listener, sensor, SensorManager.SENSOR_DELAY_NORMAL)
+
+        local handler = Handler(Looper.getMainLooper())
+        handler.postDelayed(Runnable({ run = guard("light sensor timeout", function()
+            if not got then
+                got = true
+                pcall(function() sm.unregisterListener(listener) end)
+                vibratePattern("error")
+                notify("The light sensor gave no reading. Please try again.")
+                finished()
+            end
+        end) }), 3000)
+    end)
+    if not ok then
+        pcall(reportError, "Light Detector", tostring(err))
+        finished()
+    end
+end
+
+-- Find Object: بتائیں (بول کر یا لکھ کر) کیا ڈھونڈ رہے ہیں، پھر کیمرہ رہنمائی کرتا ہے
+function showFindObjectDialog()
+    if mainDlg then pcall(function() mainDlg.dismiss() end) mainDlg = nil end
+    local layout = LinearLayout(ctx)
+    layout.setOrientation(1)
+    layout.setPadding(30, 20, 30, 20)
+
+    local intro = TextView(ctx)
+    intro.setText("What are you looking for? For example: my keys, the door, a chair, the water bottle. Type it, or tap Speak and say it.")
+    intro.setTextSize(13)
+    layout.addView(intro)
+
+    local input = EditText(ctx)
+    input.setHint("What are you looking for?")
+    layout.addView(input)
+
+    local dlg = LuaDialog(ctx)
+    dlg.setTitle("Find Object")
+    pcall(applyAccessibilityLabels, layout)
+    dlg.setView(layout)
+    dlg.setPositiveButton("Start", guard("find object start", function()
+        local target = tostring(input.getText().toString()):gsub("^%s+", ""):gsub("%s+$", "")
+        if target == "" then
+            notify("Please type or say what you are looking for.")
+            showFindObjectDialog()
+            return
+        end
+        startLiveMode({ kind = "find", target = target })
+    end))
+    dlg.setNeutralButton("🎤 Speak", guard("find object speak", function()
+        askQuestionInLiveMode(nil, nil, 1, function(q)
+            startLiveMode({ kind = "find", target = tostring(q) })
+        end)
+    end))
+    dlg.setNegativeButton("Main Menu", guard("find object main menu", function() createMainUI() end))
+    dlg.show()
+end
+
+-- موجودہ اسکرین کے نظر آنے والے متن جمع کرتا ہے (Screen Translator / Describe Current Screen)
+local function collectScreenTexts(limitChars)
+    local root = nil
+    pcall(function() root = service.getRootInActiveWindow() end)
+    if not root then return nil end
+    local items = {}
+    local total = 0
+    local function walk(node, depth)
+        if depth > 14 or total > limitChars then return end
+        local visible = false
+        pcall(function() visible = node.isVisibleToUser() end)
+        if not visible then return end
+        local text, desc = "", ""
+        pcall(function()
+            local t = node.getText()
+            if t then text = tostring(t) end
+        end)
+        pcall(function()
+            local d = node.getContentDescription()
+            if d then desc = tostring(d) end
+        end)
+        local label = text
+        if label == "" then label = desc end
+        if label ~= "" and items[#items] ~= label then
+            table.insert(items, label)
+            total = total + #label
+        end
+        local count = 0
+        pcall(function() count = node.getChildCount() end)
+        for i = 0, count - 1 do
+            local child = nil
+            pcall(function() child = node.getChild(i) end)
+            if child then walk(child, depth + 1) end
+        end
+    end
+    walk(root, 0)
+    return items
+end
+
+function runScreenTool(kind)
+    local apiKey = getAIApiKey()
+    if not apiKey or apiKey == "" then
+        vibratePattern("error")
+        notify("API Key missing! Set it in Settings.")
+        return
+    end
+    if mainDlg then pcall(function() mainDlg.dismiss() end) mainDlg = nil end
+    notify("Reading the screen. Please wait.")
+    local handler = Handler(Looper.getMainLooper())
+    handler.postDelayed(Runnable({ run = guard("screen tool", function()
+        local items = collectScreenTexts(7000)
+        if not items or #items == 0 then
+            vibratePattern("error")
+            notify("No readable text was found on the screen.")
+            return
+        end
+        local lang = getSelectedLanguage()
+        local body = safeUtf8Cut(table.concat(items, "\n"), 5000)
+        local prompt, title
+        if kind == "translate" then
+            title = "Screen Translator"
+            prompt = "Below are the visible text items of a phone screen, one per line. Translate every item into " .. lang .. ", keeping the same order and one item per line. Leave numbers, times and symbols as they are. Do not add comments or notes.\n\n" .. body
+        else
+            title = "Current Screen"
+            prompt = "Below are the visible text items of a phone screen, one per line, from top to bottom. Describe this screen to a blind user: what app or page it seems to be, the main content, and the buttons or links that are available and what they probably do. Be concise. IMPORTANT: reply ONLY in " .. lang .. ", with no words from any other language (unless " .. lang .. " itself is English).\n\n" .. body
+        end
+        showProgress("Working...")
+        callAIWithImage(apiKey, getAIModel(), nil, prompt, function(res, err)
+            hideProgress()
+            if res then
+                saveHistoryEntry(title, res)
+                vibratePattern("success")
+                showResultDialog(title, res)
+            else
+                vibratePattern("error")
+            end
+        end, { maxTokens = 700, noCache = true })
+    end) }), 900)
+end
+
+-- Smart Tools مینو
+function showSmartToolsMenu()
+    local scroll = ScrollView(ctx)
+    scroll.setFillViewport(true)
+    local layout = LinearLayout(ctx)
+    layout.setOrientation(1)
+    layout.setPadding(30, 20, 30, 20)
+    scroll.addView(layout)
+
+    local dlg = LuaDialog(ctx)
+    local function addItem(label, description, action)
+        local b = Button(ctx)
+        b.setText(label)
+        b.setContentDescription(description)
+        b.setLayoutParams(LinearLayout.LayoutParams(-1, -2))
+        b.onClick = guard("smart tools: " .. label, function()
+            dlg.dismiss()
+            local ok, err = pcall(action)
+            if not ok then pcall(reportError, "Smart Tools: " .. label, tostring(err)) end
+        end)
+        layout.addView(b)
+    end
+
+    addItem("📸 Camera Mode", "Camera mode: take a picture and analyse it in the mode you selected", function() startLiveMode({ kind = "camera" }) end)
+    addItem("💊 Medicine Reader (Camera)", "Medicine reader: take a picture of a medicine and read it", function() startLiveMode({ kind = "camera", mode = "Label & Medicine Reader" }) end)
+    addItem("📄 Document Reader", "Document reader: guides you and reads a page", function() startLiveMode({ kind = "document" }) end)
+    addItem("🔎 Find Object", "Find object: tells you where the thing you are looking for is", showFindObjectDialog)
+    addItem("💡 Light Detector", "Light detector: tells you if the room is dark or lit", function() runLightDetector(false) end)
+    addItem("🌐 Screen Translator", "Screen translator: translates the text on the current screen", function() runScreenTool("translate") end)
+    addItem("🖥 Describe Current Screen", "Describe the current screen and its buttons", function() runScreenTool("describe") end)
+
+    dlg.setTitle("Smart Tools")
+    pcall(applyAccessibilityLabels, scroll)
+    dlg.setView(scroll)
+    dlg.setPositiveButton("Close", nil)
+    dlg.show()
+end
+
+-- ایپ کھلتے ہی منتخب ڈیفالٹ موڈ کھولتا ہے؛ کامیاب ہو تو true
+function launchDefaultMode()
+    local mode = getDefaultMode()
+    if not mode or mode == "" or mode == "None" then return false end
+    local actions = {
+        ["Live Mode"] = function() startLiveMode({ kind = "live" }) end,
+        ["Camera Mode"] = function() startLiveMode({ kind = "camera" }) end,
+        ["Find Object"] = function() showFindObjectDialog() end,
+        ["Document Reader"] = function() startLiveMode({ kind = "document" }) end,
+        ["Voice Message to Text"] = function() showVoiceToTextDialog() end,
+        ["Light Detector"] = function() runLightDetector(true) end
+    }
+    local action = actions[mode]
+    if not action then return false end
+    logInfo("Opening default mode: " .. tostring(mode))
+    action()
+    return true
+end
+
+function startApp()
+    if not launchDefaultMode() then createMainUI() end
 end
 
 -- =====================================================================
@@ -5025,6 +5777,7 @@ function showMoreMenu()
 end
 
 function createMainUI()
+    if mainDlg then pcall(function() mainDlg.dismiss() end) mainDlg = nil end
     local scrollMain = ScrollView(ctx)
     scrollMain.setFillViewport(true)
     
@@ -5077,6 +5830,13 @@ function createMainUI()
         startLiveMode()
     end)
     layout.addView(btnLiveMode)
+
+    -- Smart Tools: Camera Mode, Document Reader, Find Object, Light Detector, Screen Translator ...
+    local btnSmartTools = Button(ctx)
+    btnSmartTools.setText("🧰 SMART TOOLS")
+    btnSmartTools.setContentDescription("Smart tools: camera mode, medicine reader, document reader, find object, light detector, screen translator and describe current screen")
+    btnSmartTools.onClick = guard("smart tools", function() showSmartToolsMenu() end)
+    layout.addView(btnSmartTools)
     
     _G.statusLabel = TextView(ctx)
     _G.statusLabel.setText("No file selected")
@@ -5273,7 +6033,7 @@ logInfo("CSR AI Vision Assistant started. Model=" .. getAIModel() .. " Language=
 if isShakeEnabled() then
     pcall(registerShakeListener)
 end
-local startOk, startErr = pcall(createMainUI)
+local startOk, startErr = pcall(startApp)
 if not startOk then
     pcall(reportError, "Starting the app", tostring(startErr))
 end
